@@ -50,6 +50,9 @@ pub struct App {
     pub dismissed_permanent: std::collections::HashSet<String>,
     /// Blocked stats delta per tick: (name, delta_count, recent_mean_us).
     pub blocked_deltas: Vec<(String, u64, f64)>,
+    /// Counter deltas per tick: (name, delta, cumulative).
+    pub counter_deltas: Vec<(String, u64, u64)>,
+    pub show_counters: bool,
     pub verbose_devices: bool,
 }
 
@@ -79,6 +82,8 @@ impl App {
             stall_events: Vec::new(),
             proposal: None,
             blocked_deltas: Vec::new(),
+            counter_deltas: Vec::new(),
+            show_counters: false,
             dismissed_temp: Vec::new(),
             dismissed_permanent: std::collections::HashSet::new(),
             verbose_devices: false,
@@ -178,6 +183,22 @@ impl App {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
                 _ => b.1.cmp(&a.1).then(a.0.cmp(&b.0)),
+            }
+        });
+
+        // Compute counter deltas
+        self.counter_deltas = new_snap.counters.iter().map(|(name, &val)| {
+            let prev_val = self.current.counters.get(name).copied().unwrap_or(val);
+            let delta = val.saturating_sub(prev_val);
+            (name.clone(), delta, val)
+        }).collect();
+        // Sort: active first by delta desc, then alphabetical
+        self.counter_deltas.sort_by(|a, b| {
+            match (a.1 > 0, b.1 > 0) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ if a.1 != b.1 => b.1.cmp(&a.1),
+                _ => a.0.cmp(&b.0),
             }
         });
 

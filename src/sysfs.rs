@@ -155,9 +155,15 @@ fn read_dir_u64_files(dir: &Path) -> HashMap<String, u64> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if let Ok(content) = std::fs::read_to_string(entry.path()) {
-            if let Ok(val) = content.trim().parse::<u64>() {
-                map.insert(name, val);
-            }
+            // Try plain number first, then "since mount: N" format
+            let val = content.trim().parse::<u64>().unwrap_or_else(|_| {
+                content.lines()
+                    .find(|l| l.contains("since mount"))
+                    .and_then(|l| l.split(':').last())
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0)
+            });
+            map.insert(name, val);
         }
     }
     map

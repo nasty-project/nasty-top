@@ -90,7 +90,9 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // Table height: header + rows + total/padding + 2 borders
-    let dev_count = if app.show_blocked {
+    let dev_count = if app.show_counters {
+        app.counter_deltas.len().min(30).max(10)
+    } else if app.show_blocked {
         app.current.blocked_stats.len().max(5)
     } else if app.show_processes {
         20
@@ -223,8 +225,10 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // ── Device / Process / Blocked table ──
-    if app.show_blocked {
+    // ── Device / Process / Blocked / Counter table ──
+    if app.show_counters {
+        draw_counter_table(f, app, chunks[1], focus_style);
+    } else if app.show_blocked {
         draw_blocked_table(f, app, chunks[1], focus_style);
     } else if app.show_processes {
         draw_process_table(f, app, chunks[1], focus_style);
@@ -487,7 +491,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let para = Paragraph::new(msg.clone()).style(Style::default().fg(Color::Green));
         f.render_widget(para, area);
     } else {
-        let mut help = String::from("[Tab] switch  [↑↓] navigate  [Enter] edit  [o] options  [p] procs  [t] blocked  [r] reconcile  [f] fs  [q] quit");
+        let mut help = String::from("[o] options  [c] counters  [t] blocked  [p] procs  [r] reconcile  [f] fs  [q] quit");
         if !app.dismissed_permanent.is_empty() {
             help.push_str(&format!("  ({} suppressed — [C] clear)", app.dismissed_permanent.len()));
         }
@@ -497,6 +501,42 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ── Helpers ──
+
+fn draw_counter_table(f: &mut Frame, app: &App, area: Rect, border_style: Style) {
+    let block = Block::default()
+        .title(" Counters — [c] toggle ")
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    let header = Row::new(vec!["Counter", "/tick", "/s", "Total"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let interval = 2.0_f64; // tick interval
+    let rows: Vec<Row> = app.counter_deltas.iter().map(|(name, delta, total)| {
+        let active = *delta > 0;
+        let style = if active {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let per_sec = if active { format!("{:.0}", *delta as f64 / interval) } else { "0".into() };
+        Row::new(vec![
+            Cell::new(name.clone()),
+            Cell::new(if active { format!("+{}", delta) } else { "0".into() }),
+            Cell::new(per_sec),
+            Cell::new(format!("{}", total)),
+        ]).style(style)
+    }).collect();
+
+    let widths = [
+        Constraint::Min(35),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(12),
+    ];
+    let table = Table::new(rows, widths).header(header).block(block);
+    f.render_widget(table, area);
+}
 
 fn draw_blocked_table(f: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()

@@ -96,15 +96,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('n') | KeyCode::Char('N') => app.dismiss_proposal(),
                     KeyCode::Char('!') => app.dismiss_permanent(),
                     KeyCode::Char('C') => app.clear_dismissals(),
+                    KeyCode::Char('c') => {
+                        app.show_counters = !app.show_counters;
+                        if app.show_counters { app.show_processes = false; app.show_blocked = false; }
+                    }
                     KeyCode::Char('r') => app.toggle_reconcile(),
                     KeyCode::Char('t') => {
                         app.show_blocked = !app.show_blocked;
-                        if app.show_blocked { app.show_processes = false; }
+                        if app.show_blocked { app.show_processes = false; app.show_counters = false; }
                     }
                     KeyCode::Char('p') => {
                         app.show_processes = !app.show_processes;
                         if app.show_processes {
                             app.show_blocked = false;
+                            app.show_counters = false;
                             // Reset baseline so first tick shows rates
                             app.prev_proc_io = sysfs::read_all_process_io();
                         }
