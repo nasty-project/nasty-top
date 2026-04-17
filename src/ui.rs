@@ -47,9 +47,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .map(|s| s.as_str())
         .unwrap_or("none");
 
+    let fs_indicator = if app.all_fs.len() > 1 {
+        format!(" [{}/{}]", app.fs_index + 1, app.all_fs.len())
+    } else {
+        String::new()
+    };
+
     let title = format!(
-        " nasty-top │ {} ({}) │ {:.1} GiB / {:.1} GiB ({:.1}%) │ {}x {}",
-        fs.fs_name, fs.mount_point, used_gb, total_gb, pct, replicas, compression
+        " nasty-top │ {} ({}) │ {:.1} GiB / {:.1} GiB ({:.1}%) │ {}x {}{}",
+        fs.fs_name, fs.mount_point, used_gb, total_gb, pct, replicas, compression, fs_indicator
     );
 
     let block = Block::default()
@@ -422,13 +428,9 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(8),    // options list
-            Constraint::Length(5), // markers
-        ])
+        .constraints([Constraint::Min(8)])
         .split(area);
 
-    // ── Options list ──
     {
         let block = Block::default()
             .title(" Options (Enter to edit) ")
@@ -470,29 +472,6 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(table, chunks[0]);
     }
 
-    // ── Markers ──
-    {
-        let block = Block::default()
-            .title(" Markers [m]save [1-9]load ")
-            .borders(Borders::ALL)
-            .border_style(focus_style);
-
-        let lines: Vec<Line> = (0..3)
-            .map(|i| {
-                let label = app
-                    .tuning
-                    .markers
-                    .get(i)
-                    .and_then(|m| m.as_ref())
-                    .map(|m| format!("[{}] {}", i + 1, m.label))
-                    .unwrap_or_else(|| format!("[{}] (empty)", i + 1));
-                Line::from(label)
-            })
-            .collect();
-
-        let para = Paragraph::new(lines).block(block);
-        f.render_widget(para, chunks[1]);
-    }
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -513,7 +492,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let para = Paragraph::new(msg.clone()).style(Style::default().fg(Color::Green));
         f.render_widget(para, area);
     } else {
-        let mut help = String::from("[Tab] switch  [↑↓] navigate  [Enter] edit  [o] options  [p] procs  [t] blocked  [m] mark  [q] quit");
+        let mut help = String::from("[Tab] switch  [↑↓] navigate  [Enter] edit  [o] options  [p] procs  [t] blocked  [r] reconcile  [f] fs  [q] quit");
         if !app.dismissed_permanent.is_empty() {
             help.push_str(&format!("  ({} suppressed — [C] clear)", app.dismissed_permanent.len()));
         }

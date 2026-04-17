@@ -1,6 +1,6 @@
 # nasty-top
 
-Interactive bcachefs tuning workbench. Live metrics on the left, tunable sysfs knobs on the right. Change a setting, see the effect immediately.
+A top-like TUI for bcachefs filesystems. Real-time per-device IO, latency, and internal stats with built-in tuning advisor.
 
 Built for [NASty](https://github.com/nasty-project/nasty) but works on any system with a mounted bcachefs filesystem.
 

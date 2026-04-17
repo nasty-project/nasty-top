@@ -14,13 +14,6 @@ fn hidden_set() -> HashSet<&'static str> {
         .collect()
 }
 
-/// A saved configuration snapshot (marker).
-#[derive(Debug, Clone)]
-pub struct Marker {
-    pub label: String,
-    pub options: HashMap<String, String>,
-}
-
 /// State for the tuning panel.
 pub struct TuningState {
     /// Sorted list of option names for stable iteration order.
@@ -31,8 +24,6 @@ pub struct TuningState {
     pub editing: bool,
     /// Edit buffer.
     pub edit_buf: String,
-    /// Saved markers (up to 9).
-    pub markers: [Option<Marker>; 9],
 }
 
 impl TuningState {
@@ -49,7 +40,6 @@ impl TuningState {
             selected: 0,
             editing: false,
             edit_buf: String::new(),
-            markers: Default::default(),
         }
     }
 
@@ -104,32 +94,4 @@ impl TuningState {
         Ok(value)
     }
 
-    /// Save current options as a marker.
-    pub fn save_marker(&mut self, slot: usize, options: &HashMap<String, String>) {
-        if slot < 9 {
-            self.markers[slot] = Some(Marker {
-                label: format!("Marker {}", slot + 1),
-                options: options.clone(),
-            });
-        }
-    }
-
-    /// Restore a marker — writes all options back to sysfs.
-    pub fn restore_marker(&self, slot: usize, fs: &BcachefsFs) -> Result<(), String> {
-        let marker = self.markers.get(slot)
-            .and_then(|m| m.as_ref())
-            .ok_or_else(|| format!("marker {} is empty", slot + 1))?;
-
-        let mut errors = Vec::new();
-        for (name, value) in &marker.options {
-            if let Err(e) = sysfs::write_option(fs, name, value) {
-                errors.push(e);
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
-    }
 }

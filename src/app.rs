@@ -31,6 +31,10 @@ pub struct App {
     pub last_tick: Instant,
     pub status_msg: Option<String>,
     pub should_quit: bool,
+    /// All discovered bcachefs filesystems.
+    pub all_fs: Vec<sysfs::BcachefsFs>,
+    /// Index of the currently active filesystem in all_fs.
+    pub fs_index: usize,
     pub show_options: bool,
     pub show_processes: bool,
     pub show_blocked: bool,
@@ -47,12 +51,11 @@ pub struct App {
     /// Blocked stats delta per tick: (name, delta_count, recent_mean_us).
     pub blocked_deltas: Vec<(String, u64, f64)>,
     pub verbose_devices: bool,
-    /// Next marker slot to fill (rotates 0-8).
-    pub next_marker_slot: usize,
 }
 
 impl App {
-    pub fn new(fs: BcachefsFs) -> Self {
+    pub fn new(all_fs: Vec<BcachefsFs>, fs_index: usize) -> Self {
+        let fs = all_fs[fs_index].clone();
         let snap = sysfs::snapshot(&fs);
         let tuning = TuningState::new(&snap.options);
         Self {
@@ -66,6 +69,8 @@ impl App {
             last_tick: Instant::now(),
             status_msg: None,
             should_quit: false,
+            all_fs,
+            fs_index,
             show_options: false,
             show_processes: false,
             show_blocked: false,
@@ -77,7 +82,6 @@ impl App {
             dismissed_temp: Vec::new(),
             dismissed_permanent: std::collections::HashSet::new(),
             verbose_devices: false,
-            next_marker_slot: 0,
         }
     }
 
@@ -205,24 +209,6 @@ impl App {
         };
     }
 
-    pub fn save_marker(&mut self) {
-        let slot = self.next_marker_slot;
-        self.tuning.save_marker(slot, &self.current.options);
-        self.status_msg = Some(format!("Saved marker {} with current options", slot + 1));
-        self.next_marker_slot = (self.next_marker_slot + 1) % 9;
-    }
-
-    pub fn restore_marker(&mut self, slot: usize) {
-        match self.tuning.restore_marker(slot, &self.fs) {
-            Ok(()) => {
-                self.status_msg = Some(format!("Restored marker {}", slot + 1));
-            }
-            Err(e) => {
-                self.status_msg = Some(format!("Restore failed: {e}"));
-            }
-        }
-    }
-
 }
 
 fn format_duration_us(us: f64) -> String {
@@ -236,6 +222,26 @@ fn format_duration_us(us: f64) -> String {
 }
 
 impl App {
+    pub fn switch_fs(&mut self) {
+        if self.all_fs.len() <= 1 {
+            self.status_msg = Some("Only one filesystem mounted".into());
+            return;
+        }
+        self.fs_index = (self.fs_index + 1) % self.all_fs.len();
+        self.fs = self.all_fs[self.fs_index].clone();
+        let snap = sysfs::snapshot(&self.fs);
+        self.tuning = TuningState::new(&snap.options);
+        self.current = snap;
+        self.previous = None;
+        self.rates = None;
+        self.history = History::new(120);
+        self.stall_events.clear();
+        self.blocked_deltas.clear();
+        self.proposal = None;
+        self.status_msg = Some(format!("Switched to: {} ({}/{})",
+            self.fs.fs_name, self.fs_index + 1, self.all_fs.len()));
+    }
+
     pub fn toggle_reconcile(&mut self) {
         let current = self.current.options.get("reconcile_enabled")
             .map(|v| v.trim() == "1")

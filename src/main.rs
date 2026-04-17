@@ -39,19 +39,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let fs = if let Some(ref target) = cli.filesystem {
+    let fs_index = if let Some(ref target) = cli.filesystem {
         filesystems
-            .into_iter()
-            .find(|f| f.fs_name == *target || f.uuid == *target)
+            .iter()
+            .position(|f| f.fs_name == *target || f.uuid == *target)
             .unwrap_or_else(|| {
                 eprintln!("Filesystem '{target}' not found.");
                 std::process::exit(1);
             })
     } else {
-        filesystems.into_iter().next().unwrap()
+        0
     };
 
-    eprintln!("Monitoring: {} ({})", fs.fs_name, fs.uuid);
+    eprintln!("Monitoring: {} ({}) [{}/{}]",
+        filesystems[fs_index].fs_name, filesystems[fs_index].uuid,
+        fs_index + 1, filesystems.len());
 
     // Setup terminal
     enable_raw_mode()?;
@@ -60,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(fs);
+    let mut app = App::new(filesystems, fs_index);
     let tick_dur = Duration::from_secs_f64(cli.interval);
 
     // Main loop
@@ -125,11 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     KeyCode::Enter => app.handle_enter(),
-                    KeyCode::Char('m') => app.save_marker(),
-                    KeyCode::Char(c @ '1'..='9') => {
-                        let slot = (c as usize) - ('1' as usize);
-                        app.restore_marker(slot);
-                    }
+                    KeyCode::Char('f') => app.switch_fs(),
                     KeyCode::Esc => {
                         app.status_msg = None;
                     }
