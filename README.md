@@ -20,21 +20,27 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 
 ## Install
 
-Cross-compile from macOS (or build natively on Linux):
-
+**Homebrew (Linux):**
 ```bash
-# Install musl cross-compiler (macOS)
-brew install filosottile/musl-cross/musl-cross
-rustup target add x86_64-unknown-linux-musl
-
-# Build and deploy
-./deploy.sh root@your-nas
+brew install fenio/tap/nasty-top
 ```
 
-Or build directly on the target:
+**Download binary:**
+```bash
+curl -sL https://github.com/nasty-project/nasty-top/releases/latest/download/nasty-top-x86_64-linux.tar.gz | \
+  sudo tar xzf - -C /usr/local/bin/
+```
 
+**Build from source:**
 ```bash
 cargo install --path .
+```
+
+**Dev workflow (cross-compile from macOS):**
+```bash
+brew install filosottile/musl-cross/musl-cross
+rustup target add x86_64-unknown-linux-musl
+./deploy.sh root@your-nas
 ```
 
 ## Usage
