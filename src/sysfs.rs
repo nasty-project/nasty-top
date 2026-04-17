@@ -82,6 +82,8 @@ pub struct FsSnapshot {
 }
 
 /// Discover mounted bcachefs filesystems from /proc/mounts.
+/// Deduplicates by UUID, keeping the first mount (original, not bind mounts).
+/// Uses filesystem label for the name if set, otherwise the mount point basename.
 pub fn discover() -> Vec<BcachefsFs> {
     let content = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
@@ -96,12 +98,19 @@ pub fn discover() -> Vec<BcachefsFs> {
         let first_dev = parts[0].split(':').next().unwrap_or("");
         let uuid = read_blkid_uuid(first_dev).unwrap_or_default();
         if uuid.is_empty() || !seen.insert(uuid.clone()) {
+            // First mount wins — bind mounts appear later in /proc/mounts
             continue;
         }
-        let fs_name = Path::new(mount_point)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+
+        // Prefer filesystem label if set, otherwise use mount point basename
+        let label = read_blkid_label(first_dev);
+        let fs_name = label.unwrap_or_else(|| {
+            Path::new(mount_point)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+
         let sysfs = PathBuf::from(format!("/sys/fs/bcachefs/{uuid}"));
         if sysfs.is_dir() {
             result.push(BcachefsFs {
@@ -113,6 +122,15 @@ pub fn discover() -> Vec<BcachefsFs> {
         }
     }
     result
+}
+
+fn read_blkid_label(device: &str) -> Option<String> {
+    let output = std::process::Command::new("blkid")
+        .args(["-s", "LABEL", "-o", "value", device])
+        .output()
+        .ok()?;
+    let label = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if label.is_empty() { None } else { Some(label) }
 }
 
 fn read_blkid_uuid(device: &str) -> Option<String> {
