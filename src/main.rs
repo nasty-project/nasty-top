@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('n') | KeyCode::Char('N') => app.dismiss_proposal(),
                     KeyCode::Char('!') => app.dismiss_permanent(),
                     KeyCode::Char('C') => app.clear_dismissals(),
+                    KeyCode::Char('r') => app.toggle_reconcile(),
                     KeyCode::Char('t') => {
                         app.show_blocked = !app.show_blocked;
                         if app.show_blocked { app.show_processes = false; }

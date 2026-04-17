@@ -136,16 +136,11 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(vec![
                     Span::raw(" "),
                     Span::styled(format!("{:.0}%", jpct), Style::default().fg(jcolor).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" {}", app.current.journal_watermark), Style::default().fg(Color::DarkGray)),
                 ]),
-                {
-                    let (comp, uncomp) = app.current.compression;
-                    let ratio = if comp > 0 { uncomp as f64 / comp as f64 } else { 1.0 };
-                    Line::from(vec![
-                        Span::styled("Compr:", Style::default().fg(Color::DarkGray)),
-                        Span::raw(format!(" {:.2}x", ratio)),
-                    ])
-                },
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(app.current.journal_watermark.clone(), Style::default().fg(Color::DarkGray)),
+                ]),
             ];
             let para = Paragraph::new(lines).block(block);
             f.render_widget(para, spark_cols[0]);

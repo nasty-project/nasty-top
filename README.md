@@ -4,6 +4,8 @@ Interactive bcachefs tuning workbench. Live metrics on the left, tunable sysfs k
 
 Built for [NASty](https://github.com/nasty-project/nasty) but works on any system with a mounted bcachefs filesystem.
 
+![nasty-top screenshot](top.jpg)
+
 ## Features
 
 - **Live IO throughput and latency** per device with user/btree/journal/sb breakdown
@@ -15,7 +17,7 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Options panel** with inline editing of runtime-tunable sysfs options
 - **Configuration markers** for A/B comparison of settings
 - **Process IO view** showing which processes are doing IO
-- **Journal fill %**, compression ratio, load average, reconcile progress
+- **Journal fill %**, load average, reconcile progress
 - **Consistent color scheme**: yellow = read, blue = write, red = errors/stalls
 
 ## Install
@@ -34,10 +36,7 @@ curl -sL https://github.com/nasty-project/nasty-top/releases/latest/download/nas
 **Build from source:**
 ```bash
 cargo install --path .
-```
-
-**Dev workflow (cross-compile from macOS):**
-```bash
+# or cross-compile from macOS:
 brew install filosottile/musl-cross/musl-cross
 rustup target add x86_64-unknown-linux-musl
 ./deploy.sh root@your-nas
@@ -59,6 +58,7 @@ Options:
 | Key | Action |
 |-----|--------|
 | `o` | Toggle options panel (hidden by default) |
+| `r` | Toggle reconcile on/off |
 | `p` | Toggle process IO view |
 | `t` | Toggle blocked stats view |
 | `Tab` | Switch focus between metrics and options panel |

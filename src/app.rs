@@ -236,6 +236,17 @@ fn format_duration_us(us: f64) -> String {
 }
 
 impl App {
+    pub fn toggle_reconcile(&mut self) {
+        let current = self.current.options.get("reconcile_enabled")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        let new_val = if current { "0" } else { "1" };
+        match sysfs::write_option(&self.fs, "reconcile_enabled", new_val) {
+            Ok(()) => self.status_msg = Some(format!("reconcile_enabled = {new_val}")),
+            Err(e) => self.status_msg = Some(format!("Failed: {e}")),
+        }
+    }
+
     pub fn apply_proposal(&mut self) {
         let proposal = match self.proposal.take() {
             Some(p) => p,
