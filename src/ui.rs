@@ -145,13 +145,13 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
             let jcolor = if jpct > 80.0 { Color::Red } else if jpct > 50.0 { Color::Yellow } else { Color::Green };
 
             let lines = vec![
-                Line::from(Span::styled("Load Avg:", Style::default().fg(Color::DarkGray))),
-                Line::from(vec![Span::raw(format!(" 1m  {}", load.0))]),
-                Line::from(vec![Span::raw(format!(" 5m  {}", load.1))]),
-                Line::from(vec![Span::raw(format!("15m  {}", load.2))]),
+                Line::from(Span::styled(" Load Avg:", Style::default().fg(Color::DarkGray))),
+                Line::from(vec![Span::raw(format!("  1m  {}", load.0))]),
+                Line::from(vec![Span::raw(format!("  5m  {}", load.1))]),
+                Line::from(vec![Span::raw(format!(" 15m  {}", load.2))]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("IOWait:", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" IOWait:", Style::default().fg(Color::DarkGray)),
                     {
                         let iow = app.iowait_pct;
                         let color = if iow > 50.0 { Color::Red } else if iow > 20.0 { Color::Yellow } else { Color::Green };
@@ -159,7 +159,7 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
                     },
                 ]),
                 Line::from(vec![
-                    Span::styled("Journal: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" Journal: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{:.0}%", jpct), Style::default().fg(jcolor).add_modifier(Modifier::BOLD)),
                 ]),
             ];
