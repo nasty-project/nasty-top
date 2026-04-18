@@ -91,65 +91,99 @@ pub struct FsSnapshot {
     pub journal_watermark: String,
 }
 
-/// Discover mounted bcachefs filesystems from /proc/mounts.
+/// Discover mounted bcachefs filesystems.
+/// Scans /sys/fs/bcachefs/ for UUIDs, then matches to mount points from /proc/mounts.
 /// Deduplicates by UUID, keeping the first mount (original, not bind mounts).
 /// Uses filesystem label for the name if set, otherwise the mount point basename.
 pub fn discover() -> Vec<BcachefsFs> {
-    let content = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
-
-    for line in content.lines() {
+    // Build a map of device -> (mount_point, first occurrence order) from /proc/mounts
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let mut dev_to_mount: HashMap<String, String> = HashMap::new();
+    for line in mounts.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 3 || parts[2] != "bcachefs" {
             continue;
         }
-        let mount_point = parts[1];
-        let first_dev = parts[0].split(':').next().unwrap_or("");
-        let uuid = read_blkid_uuid(first_dev).unwrap_or_default();
-        if uuid.is_empty() || !seen.insert(uuid.clone()) {
-            // First mount wins — bind mounts appear later in /proc/mounts
+        // For multi-device, parts[0] is "dev1:dev2:..."; take first device
+        let first_dev = parts[0].split(':').next().unwrap_or("").to_string();
+        // First mount wins — bind mounts appear later in /proc/mounts
+        dev_to_mount.entry(first_dev).or_insert_with(|| parts[1].to_string());
+    }
+
+    let mut result = Vec::new();
+
+    // Scan /sys/fs/bcachefs/ — each entry is a UUID
+    let sysfs_base = Path::new("/sys/fs/bcachefs");
+    let entries = match std::fs::read_dir(sysfs_base) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+
+    for entry in entries.flatten() {
+        let uuid = entry.file_name().to_string_lossy().to_string();
+        let sysfs = entry.path();
+        if !sysfs.is_dir() {
             continue;
         }
 
-        // Prefer filesystem label if set, otherwise use mount point basename
-        let label = read_blkid_label(first_dev);
+        // Find mount point by matching devices listed under this UUID's sysfs
+        let mount_point = find_mount_for_uuid(&sysfs, &dev_to_mount)
+            .unwrap_or_default();
+
+        // Read fs label from sysfs label file if available
+        let label = std::fs::read_to_string(sysfs.join("options/label"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "(none)");
+
         let fs_name = label.unwrap_or_else(|| {
-            Path::new(mount_point)
+            Path::new(&mount_point)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default()
+                .unwrap_or_else(|| uuid.clone())
         });
 
-        let sysfs = PathBuf::from(format!("/sys/fs/bcachefs/{uuid}"));
-        if sysfs.is_dir() {
-            result.push(BcachefsFs {
-                uuid,
-                mount_point: mount_point.to_string(),
-                fs_name,
-                sysfs,
-            });
-        }
+        result.push(BcachefsFs {
+            uuid,
+            mount_point,
+            fs_name,
+            sysfs,
+        });
     }
     result
 }
 
-fn read_blkid_label(device: &str) -> Option<String> {
-    let output = std::process::Command::new("blkid")
-        .args(["-s", "LABEL", "-o", "value", device])
-        .output()
-        .ok()?;
-    let label = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if label.is_empty() { None } else { Some(label) }
+/// Find a mount point for a bcachefs UUID by matching its member devices
+/// against the device->mount map from /proc/mounts.
+fn find_mount_for_uuid(sysfs: &Path, dev_to_mount: &HashMap<String, String>) -> Option<String> {
+    let dev_dir = sysfs.join("dev-0");
+    // Read the actual block device name from sysfs
+    if dev_dir.is_dir() {
+        // Try all dev-N entries
+        for i in 0..64 {
+            let dev_n = sysfs.join(format!("dev-{i}"));
+            if !dev_n.is_dir() {
+                break;
+            }
+            // The dev-N directory is a symlink or contains info; read the block device
+            // by checking what block device it points to
+            if let Some(dev_name) = read_dev_name(&dev_n) {
+                let dev_path = format!("/dev/{dev_name}");
+                if let Some(mp) = dev_to_mount.get(&dev_path) {
+                    return Some(mp.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
-fn read_blkid_uuid(device: &str) -> Option<String> {
-    let output = std::process::Command::new("blkid")
-        .args(["-s", "UUID", "-o", "value", device])
-        .output()
-        .ok()?;
-    let uuid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if uuid.is_empty() { None } else { Some(uuid) }
+/// Read the block device name (e.g. "nvme0n1p1") from a bcachefs sysfs dev-N directory.
+fn read_dev_name(dev_dir: &Path) -> Option<String> {
+    // The "block" symlink points to the block device in sysfs
+    std::fs::read_link(dev_dir.join("block"))
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
 }
 
 /// Read all metrics for a filesystem.
