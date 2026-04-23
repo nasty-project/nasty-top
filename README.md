@@ -4,8 +4,9 @@ A top-like TUI for bcachefs filesystems. Real-time per-device IO, latency, and i
 
 Built for [NASty](https://github.com/nasty-project/nasty) but works on any system with a mounted bcachefs filesystem.
 
-![nasty-top blocked stats](screen1.jpg)
+![nasty-top device IO](screen1.jpg)
 ![nasty-top process IO](screen2.jpg)
+![nasty-top counters](screen3.jpg)
 
 ## Features
 
