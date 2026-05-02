@@ -125,3 +125,89 @@ jobs:
           git add Formula/nasty-top.rb
           git commit -m "nasty-top ${VERSION}"
           git push
+
+  update-aur:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute SHA256
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+          curl -sL "https://github.com/nasty-project/nasty-top/releases/download/${GITHUB_REF_NAME}/nasty-top-x86_64-linux.tar.gz" -o x86_64.tar.gz
+          curl -sL "https://github.com/nasty-project/nasty-top/releases/download/${GITHUB_REF_NAME}/nasty-top-aarch64-linux.tar.gz" -o aarch64.tar.gz
+
+          echo "SHA_X86=$(sha256sum x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "SHA_ARM=$(sha256sum aarch64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Generate PKGBUILD and .SRCINFO
+        run: |
+          cat > PKGBUILD << 'PKGBUILD_EOF'
+          # Maintainer: Bartosz Fenski <bartosz at fenski dot pl>
+          pkgname=nasty-top-bin
+          pkgver=VERSION_PLACEHOLDER
+          pkgrel=1
+          pkgdesc="A top-like TUI for bcachefs filesystems"
+          arch=('x86_64' 'aarch64')
+          url="https://github.com/nasty-project/nasty-top"
+          license=('GPL-3.0-only')
+          provides=('nasty-top')
+          conflicts=('nasty-top')
+          optdepends=('bcachefs-tools: required for reconcile status view')
+          source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/nasty-top-x86_64-linux.tar.gz")
+          source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/nasty-top-aarch64-linux.tar.gz")
+          sha256sums_x86_64=('SHA_X86_PLACEHOLDER')
+          sha256sums_aarch64=('SHA_ARM_PLACEHOLDER')
+
+          package() {
+            install -Dm755 "$srcdir/nasty-top" "$pkgdir/usr/bin/nasty-top"
+          }
+          PKGBUILD_EOF
+
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" PKGBUILD
+          sed -i "s/SHA_X86_PLACEHOLDER/${SHA_X86}/g" PKGBUILD
+          sed -i "s/SHA_ARM_PLACEHOLDER/${SHA_ARM}/g" PKGBUILD
+
+          {
+            printf 'pkgbase = nasty-top-bin\n'
+            printf '\tpkgdesc = A top-like TUI for bcachefs filesystems\n'
+            printf '\tpkgver = %s\n' "${VERSION}"
+            printf '\tpkgrel = 1\n'
+            printf '\turl = https://github.com/nasty-project/nasty-top\n'
+            printf '\tarch = x86_64\n'
+            printf '\tarch = aarch64\n'
+            printf '\tlicense = GPL-3.0-only\n'
+            printf '\tprovides = nasty-top\n'
+            printf '\tconflicts = nasty-top\n'
+            printf '\toptdepends = bcachefs-tools: required for reconcile status view\n'
+            printf '\tsource_x86_64 = nasty-top-bin-%s-x86_64.tar.gz::https://github.com/nasty-project/nasty-top/releases/download/v%s/nasty-top-x86_64-linux.tar.gz\n' "${VERSION}" "${VERSION}"
+            printf '\tsha256sums_x86_64 = %s\n' "${SHA_X86}"
+            printf '\tsource_aarch64 = nasty-top-bin-%s-aarch64.tar.gz::https://github.com/nasty-project/nasty-top/releases/download/v%s/nasty-top-aarch64-linux.tar.gz\n' "${VERSION}" "${VERSION}"
+            printf '\tsha256sums_aarch64 = %s\n' "${SHA_ARM}"
+            printf '\n'
+            printf 'pkgname = nasty-top-bin\n'
+          } > .SRCINFO
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${AUR_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+
+          git clone ssh://aur@aur.archlinux.org/nasty-top-bin.git aur-repo
+          cp PKGBUILD .SRCINFO aur-repo/
+          cd aur-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          if git diff --staged --quiet; then
+            echo "No changes to publish"
+            exit 0
+          fi
+          git commit -m "nasty-top-bin ${VERSION}"
+          git push
