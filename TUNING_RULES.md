@@ -16,7 +16,6 @@ Rules are implemented in `src/advisor.rs`.
 | 4 | `blocked_write_buffer_full` delta > 0 | Halve `journal_flush_delay` (min 100) | Write buffer full stalls — flushing the journal more often frees buffer space |
 | 5 | `blocked_allocate` delta > 0 | Increase `gc_reserve_percent` by 4 (max 20) | Allocator actively blocking — more GC reserve gives the allocator breathing room |
 | 6 | Write stalls (last 60s) + `copygc_enabled=1` + copygc active | Set `copygc_enabled=0` | Background copy-GC is competing with foreground writes |
-| 7 | Read stalls (last 60s) + `btree_cache_size_max=0` (auto) | Set `btree_cache_size_max=512M` | Read stalls with auto-sized btree cache — explicit larger cache may reduce btree read misses |
 
 ## Stall Detection
 
@@ -45,6 +44,7 @@ The `time_stats/blocked_*` entries are the most precise bottleneck indicators. T
 
 ## Future Rule Ideas
 
+- Write stalls while rebalance is active → throttle via `move_bytes_in_flight` / `move_ios_in_flight` (needs empirical validation; the older `rebalance_enabled` knob no longer exists upstream)
 - High `blocked_journal_max_in_flight` rate → reduce concurrent writers or increase journal size
 - Read amplification (btree reads >> user reads) → suggest larger btree node size (mount-time only)
 - Device with significantly higher latency than others → flag potential hardware issue

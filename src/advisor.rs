@@ -135,43 +135,5 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
         }
     }
 
-    // Rule 4: Write stalls while rebalance is running → disable rebalance
-    let rebalance_on = opts.get("rebalance_enabled").map(|v| v == "1").unwrap_or(false);
-    if has_write_stalls && rebalance_on {
-        let rebalance_active = app.current.background.iter()
-            .any(|(k, v)| k == "rebalance" && v.contains("running"));
-        if rebalance_active {
-            return Some(Proposal {
-                reason: "Write stalls while rebalance running — pause rebalance".into(),
-                option: "rebalance_enabled".into(),
-                value: "0".into(),
-                command: format!("echo 0 > {}/rebalance_enabled", sysfs_base),
-            });
-        }
-    }
-
-    // Rule 5: Read stalls + btree_cache_size_max is 0 (auto) → set explicit cache
-    let has_read_stalls = app.stall_events.iter().any(|e| {
-        e.direction == "read" && e.time.elapsed().as_secs() < 60
-    });
-    if has_read_stalls {
-        let cache_max: u64 = opts.get("btree_cache_size_max")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if cache_max == 0 {
-            return Some(Proposal {
-                reason: "Read stalls with auto btree cache — set explicit 512MB".into(),
-                option: "btree_cache_size_max".into(),
-                value: "512M".into(),
-                command: format!("echo 512M > {}/btree_cache_size_max", sysfs_base),
-            });
-        }
-    }
-
-    // Rule 6: blocked_allocate actively increasing + gc_reserve low → increase
-    // (removed the vague "many stalls" heuristic — only suggest when allocator
-    // pressure is actually observed via blocked_allocate delta)
-
-
     None
 }
