@@ -707,7 +707,7 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame) {
     let area = f.area();
     let w = 50u16.min(area.width.saturating_sub(4));
-    let h = 22u16.min(area.height.saturating_sub(4));
+    let h = 26u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -734,16 +734,19 @@ fn draw_help(f: &mut Frame) {
         Line::from(Span::styled("  g  copygc on/off", Style::default().fg(theme::FG))),
         Line::from(""),
         Line::from(Span::styled("Options panel", theme::bold(theme::ACCENT))),
-        Line::from(Span::styled("  Tab    switch focus", Style::default().fg(theme::FG))),
-        Line::from(Span::styled("  \u{2191}\u{2193}    navigate options", Style::default().fg(theme::FG))),
-        Line::from(Span::styled("  Enter  edit selected option", Style::default().fg(theme::FG))),
-        Line::from(Span::styled("  Esc    cancel edit", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  Tab     switch focus", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  \u{2191}\u{2193} / jk  navigate / scroll views", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  Enter   edit selected option", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  Esc     cancel edit", Style::default().fg(theme::FG))),
         Line::from(""),
         Line::from(Span::styled("Advisor", theme::bold(theme::ACCENT))),
         Line::from(Span::styled("  Y  apply suggestion", Style::default().fg(theme::FG))),
         Line::from(Span::styled("  N  dismiss (2 min)", Style::default().fg(theme::FG))),
         Line::from(Span::styled("  !  never suggest again", Style::default().fg(theme::FG))),
         Line::from(Span::styled("  C  clear permanent dismissals", Style::default().fg(theme::FG))),
+        Line::from(""),
+        Line::from(Span::styled("Quit", theme::bold(theme::ACCENT))),
+        Line::from(Span::styled("  q / Ctrl-C", Style::default().fg(theme::FG))),
     ];
 
     let para = Paragraph::new(help_text).block(block);

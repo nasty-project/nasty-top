@@ -64,19 +64,23 @@ Options:
 
 | Key | Action |
 |-----|--------|
+| `?` | Toggle help popup |
 | `o` | Toggle options panel (hidden by default) |
-| `r` | Toggle reconcile on/off |
+| `c` | Toggle counters view |
+| `t` | Toggle blocked stats / time_stats view |
 | `p` | Toggle process IO view |
-| `t` | Toggle blocked stats view |
-| `Tab` | Switch focus between metrics and options panel |
-| `Enter` | Edit selected option value |
-| `Esc` | Cancel edit |
+| `r` | Toggle reconcile on/off |
+| `g` | Toggle copygc on/off |
 | `f` | Cycle between filesystems |
+| `Tab` | Switch focus between metrics and options panel |
+| `↑`/`k`, `↓`/`j` | Navigate options / scroll counter, blocked, process views |
+| `Enter` | Edit selected option value (in options panel) |
+| `Esc` | Cancel edit / dismiss status message |
 | `Y` | Apply advisor suggestion |
 | `N` | Dismiss suggestion for 2 minutes |
 | `!` | Permanently dismiss suggestion |
 | `C` | Clear all permanent dismissals |
-| `q` | Quit |
+| `q` / `Ctrl-C` | Quit |
 
 ## Data Sources
 
