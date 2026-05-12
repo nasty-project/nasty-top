@@ -333,8 +333,43 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
             diskstats_writes: ds_writes,
         });
     }
-    devices.sort_by_key(|d| d.index);
+    // Sort by (label, natural device name) so labeled groups stay together
+    // and sd[a-z]+ devices order as sda < sdz < sdaa rather than lexically.
+    devices.sort_by(|a, b| {
+        a.label.cmp(&b.label)
+            .then_with(|| natural_key(&a.name).cmp(&natural_key(&b.name)))
+    });
     devices
+}
+
+/// Tokenize a name into runs of letters and digits for natural ordering.
+/// Letter runs compare by (length, lex) so "sda" < "sdz" < "sdaa".
+/// Digit runs compare numerically so "nvme0n1" < "nvme10n1".
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum NatToken {
+    Letters(usize, String),
+    Number(u64),
+}
+
+fn natural_key(s: &str) -> Vec<NatToken> {
+    let bytes = s.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_digit = bytes[i].is_ascii_digit();
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_digit() == is_digit {
+            j += 1;
+        }
+        let slice = &s[i..j];
+        tokens.push(if is_digit {
+            NatToken::Number(slice.parse().unwrap_or(0))
+        } else {
+            NatToken::Letters(slice.len(), slice.to_string())
+        });
+        i = j;
+    }
+    tokens
 }
 
 /// Read per-device recent (EWMA) latency from io_latency_stats_{direction}_json.
