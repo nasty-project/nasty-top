@@ -6,9 +6,9 @@ license = "GPL-3.0-only"
 description = "A top-like TUI for bcachefs filesystems"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-nix = { version = "0.30", features = ["fs"] }
+nix = { version = "0.31", features = ["fs"] }
