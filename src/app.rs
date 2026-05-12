@@ -53,8 +53,12 @@ pub struct App {
     pub process_rates: Vec<ProcessRate>,
     /// Recent stall events (newest first, capped at 10).
     pub stall_events: Vec<StallEvent>,
-    /// Current tuning proposal from the advisor.
+    /// Current advisor hint (informational only).
     pub proposal: Option<crate::advisor::Proposal>,
+    /// When the current hint first appeared — used to enforce a minimum
+    /// display time so triggers that fire for a single tick stay visible
+    /// long enough to read.
+    pub proposal_first_shown: Option<Instant>,
     /// Temporarily dismissed: (option_name, dismissed_at).
     pub dismissed_temp: Vec<(String, std::time::Instant)>,
     /// Permanently dismissed option names ("don't ask again").
@@ -98,6 +102,7 @@ impl App {
             process_rates: Vec::new(),
             stall_events: Vec::new(),
             proposal: None,
+            proposal_first_shown: None,
             blocked_deltas: Vec::new(),
             counter_deltas: Vec::new(),
             time_stats_view: Vec::new(),
@@ -270,8 +275,30 @@ impl App {
         self.previous = Some(std::mem::replace(&mut self.current, new_snap));
         self.rates = Some(rates);
 
-        // Run advisor
-        self.proposal = crate::advisor::evaluate(self);
+        // Run advisor. Hints persist for at least MIN_HINT_DISPLAY even if
+        // the trigger condition stops firing, so single-tick triggers don't
+        // flash by faster than the user can read.
+        const MIN_HINT_DISPLAY: std::time::Duration = std::time::Duration::from_secs(15);
+        let new_proposal = crate::advisor::evaluate(self);
+        match (self.proposal.as_ref(), new_proposal) {
+            (Some(curr), Some(new)) if curr.option == new.option => {
+                self.proposal = Some(new);
+            }
+            (_, Some(new)) => {
+                self.proposal = Some(new);
+                self.proposal_first_shown = Some(now);
+            }
+            (Some(_), None) => {
+                let elapsed = self.proposal_first_shown
+                    .map(|t| t.elapsed())
+                    .unwrap_or(MIN_HINT_DISPLAY);
+                if elapsed >= MIN_HINT_DISPLAY {
+                    self.proposal = None;
+                    self.proposal_first_shown = None;
+                }
+            }
+            (None, None) => {}
+        }
 
         // Process I/O
         if self.show_processes {
@@ -324,6 +351,7 @@ impl App {
         self.stall_events.clear();
         self.blocked_deltas.clear();
         self.proposal = None;
+        self.proposal_first_shown = None;
         self.status_msg = Some(format!("Switched to: {} ({}/{})",
             self.fs.fs_name, self.fs_index + 1, self.all_fs.len()));
     }
@@ -339,35 +367,22 @@ impl App {
         }
     }
 
-    pub fn apply_proposal(&mut self) {
-        let proposal = match self.proposal.take() {
-            Some(p) => p,
-            None => return,
-        };
-        match sysfs::write_option(&self.fs, &proposal.option, &proposal.value) {
-            Ok(()) => {
-                self.status_msg = Some(format!("Applied: {} = {}", proposal.option, proposal.value));
-            }
-            Err(e) => {
-                self.status_msg = Some(format!("Failed: {e}"));
-            }
-        }
-    }
-
     pub fn dismiss_proposal(&mut self) {
         if let Some(ref p) = self.proposal {
             self.dismissed_temp.push((p.option.clone(), std::time::Instant::now()));
         }
         self.proposal = None;
-        self.status_msg = Some("Dismissed for 2 minutes".into());
+        self.proposal_first_shown = None;
+        self.status_msg = Some("Muted for 2 minutes".into());
     }
 
     pub fn dismiss_permanent(&mut self) {
         if let Some(ref p) = self.proposal {
             self.dismissed_permanent.insert(p.option.clone());
-            self.status_msg = Some(format!("Won't suggest {} again (press C to clear)", p.option));
+            self.status_msg = Some(format!("Won't hint about {} again (press C to clear)", p.option));
         }
         self.proposal = None;
+        self.proposal_first_shown = None;
     }
 
     pub fn clear_dismissals(&mut self) {

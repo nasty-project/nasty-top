@@ -15,7 +15,7 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Per-device IO breakdown** using `io_done` JSON and `io_latency_stats_*_json`
 - **Blocked stats view** showing what's actually blocking IO right now (allocator, journal, write buffer, etc.)
 - **Stall detection** with 60-second event log when latency exceeds 200ms
-- **Tuning advisor** that analyzes current state and proposes sysfs changes with one-key apply
+- **Tuning hints** that flag known bcachefs pressure signals and show an example sysfs command (informational only — not applied automatically)
 - **Options panel** with inline editing of runtime-tunable sysfs options
 - **Multi-filesystem support** — press `f` to cycle between mounted bcachefs filesystems
 - **Process IO view** showing which processes are doing IO
@@ -76,10 +76,9 @@ Options:
 | `↑`/`k`, `↓`/`j` | Navigate options / scroll counter, blocked, process views |
 | `Enter` | Edit selected option value (in options panel) |
 | `Esc` | Cancel edit / dismiss status message |
-| `Y` | Apply advisor suggestion |
-| `N` | Dismiss suggestion for 2 minutes |
-| `!` | Permanently dismiss suggestion |
-| `C` | Clear all permanent dismissals |
+| `N` | Mute current hint for 2 minutes |
+| `!` | Never show this hint again |
+| `C` | Clear all permanent mutes |
 | `q` / `Ctrl-C` | Quit |
 
 ## Data Sources
@@ -95,9 +94,9 @@ Options:
 | Process IO | `/proc/<pid>/io` | read_bytes/write_bytes diffed |
 | Options | `options/*` | Read/write directly to sysfs |
 
-## Tuning Advisor
+## Tuning Hints
 
-The advisor evaluates rules each tick and proposes sysfs changes. See [TUNING_RULES.md](TUNING_RULES.md) for the full rule set.
+When known bcachefs pressure signals fire (journal fill, blocked allocator, etc.), a hint appears in the footer with a short reason and an example sysfs command you *could* run. Nothing is applied automatically — the hint is informational. The current heuristics are unverified; treat them as a starting point for investigation, not a prescription. See [TUNING_RULES.md](TUNING_RULES.md) for the full rule set.
 
 ## License
 

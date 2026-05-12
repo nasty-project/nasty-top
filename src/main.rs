@@ -102,7 +102,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match key.code {
                     KeyCode::Char('q') => app.should_quit = true,
                     KeyCode::Char('?') => app.show_help = !app.show_help,
-                    KeyCode::Char('y') | KeyCode::Char('Y') => app.apply_proposal(),
                     KeyCode::Char('n') | KeyCode::Char('N') => app.dismiss_proposal(),
                     KeyCode::Char('!') => app.dismiss_permanent(),
                     KeyCode::Char('C') => app.clear_dismissals(),

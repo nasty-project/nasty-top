@@ -1,8 +1,10 @@
-# nasty-top Tuning Rules
+# nasty-top Tuning Hints
 
-The advisor evaluates these rules on every tick (2s), in priority order.
-The first matching rule produces a proposal shown in the footer bar.
-User presses `Y` to apply, `N` to dismiss for 2 minutes, `!` to permanently dismiss.
+These rules are evaluated on every tick (2s), in priority order. The first matching rule produces an informational hint shown in the footer bar with an example sysfs command. **Hints are not applied automatically** — the user decides whether to run the command. Press `N` to mute the current hint for 2 minutes or `!` to suppress it permanently.
+
+The heuristics are best-effort and unverified upstream; treat them as pointers to *something is happening*, not authoritative tuning advice.
+
+A hint persists for at least 15 seconds after first appearing, even if the trigger condition clears in the same interval — so single-tick triggers don't flash by faster than you can read.
 
 Rules are implemented in `src/advisor.rs`.
 

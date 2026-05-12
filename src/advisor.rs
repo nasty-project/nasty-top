@@ -1,18 +1,18 @@
-//! Tuning advisor — analyzes current state and proposes sysfs changes
-//! to avoid stalls.
+//! Tuning advisor — surfaces informational hints when known bcachefs
+//! pressure signals fire. Hints are advisory only; the user decides
+//! whether to act on them.
 
 use crate::app::App;
 
-/// A proposed tuning action.
+/// An advisory hint about a pressure signal and a candidate sysfs change.
 #[derive(Debug, Clone)]
 pub struct Proposal {
-    /// Human-readable reason.
+    /// Human-readable reason the hint fired.
     pub reason: String,
-    /// The sysfs option name.
+    /// The sysfs option the hint references (used as the dismissal key).
     pub option: String,
-    /// Proposed new value.
-    pub value: String,
-    /// Full command to show the user.
+    /// Example command the user could run themselves. Shown dimmed —
+    /// nasty-top does not apply it automatically.
     pub command: String,
 }
 
@@ -39,7 +39,6 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
             return Some(Proposal {
                 reason: format!("Journal {:.0}% full — reclaim faster", jpct),
                 option: "journal_reclaim_delay".into(),
-                value: new_val.to_string(),
                 command: format!("echo {} > {}/journal_reclaim_delay", new_val, sysfs_base),
             });
         }
@@ -55,7 +54,6 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
             return Some(Proposal {
                 reason: format!("Journal {:.0}% full (watermark: {}) — flush more often", jpct, app.current.journal_watermark),
                 option: "journal_flush_delay".into(),
-                value: new_val.to_string(),
                 command: format!("echo {} > {}/journal_flush_delay", new_val, sysfs_base),
             });
         }
@@ -79,7 +77,6 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
             return Some(Proposal {
                 reason: format!("journal_low_on_space +{} blocks (mean {:.1}ms)", delta, recent_us / 1000.0),
                 option: "journal_flush_delay".into(),
-                value: new_val.to_string(),
                 command: format!("echo {} > {}/journal_flush_delay", new_val, sysfs_base),
             });
         }
@@ -95,7 +92,6 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
             return Some(Proposal {
                 reason: format!("write_buffer_full +{} blocks (mean {:.1}ms)", delta, recent_us / 1000.0),
                 option: "journal_flush_delay".into(),
-                value: new_val.to_string(),
                 command: format!("echo {} > {}/journal_flush_delay", new_val, sysfs_base),
             });
         }
@@ -111,7 +107,6 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
             return Some(Proposal {
                 reason: format!("allocate +{} blocks (mean {:.1}ms)", delta, recent_us / 1000.0),
                 option: "gc_reserve_percent".into(),
-                value: new_val.to_string(),
                 command: format!("echo {} > {}/gc_reserve_percent", new_val, sysfs_base),
             });
         }
@@ -129,7 +124,6 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
             return Some(Proposal {
                 reason: "Write stalls while copygc active — disable copygc".into(),
                 option: "copygc_enabled".into(),
-                value: "0".into(),
                 command: format!("echo 0 > {}/copygc_enabled", sysfs_base),
             });
         }

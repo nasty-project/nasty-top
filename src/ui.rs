@@ -739,11 +739,10 @@ fn draw_help(f: &mut Frame) {
         Line::from(Span::styled("  Enter   edit selected option", Style::default().fg(theme::FG))),
         Line::from(Span::styled("  Esc     cancel edit", Style::default().fg(theme::FG))),
         Line::from(""),
-        Line::from(Span::styled("Advisor", theme::bold(theme::ACCENT))),
-        Line::from(Span::styled("  Y  apply suggestion", Style::default().fg(theme::FG))),
-        Line::from(Span::styled("  N  dismiss (2 min)", Style::default().fg(theme::FG))),
-        Line::from(Span::styled("  !  never suggest again", Style::default().fg(theme::FG))),
-        Line::from(Span::styled("  C  clear permanent dismissals", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("Hints (informational)", theme::bold(theme::ACCENT))),
+        Line::from(Span::styled("  N  mute current hint (2 min)", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  !  never show this hint again", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  C  clear permanent mutes", Style::default().fg(theme::FG))),
         Line::from(""),
         Line::from(Span::styled("Quit", theme::bold(theme::ACCENT))),
         Line::from(Span::styled("  q / Ctrl-C", Style::default().fg(theme::FG))),
@@ -756,13 +755,12 @@ fn draw_help(f: &mut Frame) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ref proposal) = app.proposal {
         let mut spans = vec![
-            Span::styled(" SUGGEST ", Style::default().fg(theme::BG).bg(theme::YELLOW).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {} ", proposal.reason), Style::default().fg(theme::YELLOW)),
-            Span::styled(&proposal.command, theme::bold(theme::FG)),
+            Span::styled(" HINT ", Style::default().fg(theme::BG).bg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {} ", proposal.reason), Style::default().fg(theme::ACCENT)),
+            Span::styled(&proposal.command, theme::dim()),
             Span::raw("  "),
         ];
-        spans.extend(key_hint("Y", "apply"));
-        spans.extend(key_hint("N", "dismiss"));
+        spans.extend(key_hint("N", "mute 2min"));
         spans.extend(key_hint("!", "never"));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     } else if let Some(ref msg) = app.status_msg {
