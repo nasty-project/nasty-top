@@ -447,6 +447,7 @@ fn draw_device_table(
     let mut sr = [0.0_f64; 5];
     let mut sw = [0.0_f64; 5];
     let mut sum_errs = 0u64;
+    let mut sum_new_errs = 0u64;
 
     struct DevData {
         name: String,
@@ -460,6 +461,7 @@ fn draw_device_table(
         read_active: bool,
         write_active: bool,
         errors: u64,
+        new_errors: u64,
         util_pct: f64,
     }
     let mut devs: Vec<DevData> = Vec::new();
@@ -474,12 +476,15 @@ fn draw_device_table(
             sr[4] += d.read_bytes_sec;
             sw[4] += d.write_bytes_sec;
             sum_errs += d.io_errors;
+            let baseline = app.initial_errors.get(&d.name).copied().unwrap_or(d.io_errors);
+            let new_errors = d.io_errors.saturating_sub(baseline);
+            sum_new_errs += new_errors;
             devs.push(DevData {
                 name: d.name.clone(), label: d.label.clone(), rv, wv,
                 read_total: d.read_bytes_sec, write_total: d.write_bytes_sec,
                 read_lat: d.read_latency_ns, write_lat: d.write_latency_ns,
                 read_active: d.read_active, write_active: d.write_active,
-                errors: d.io_errors, util_pct: d.util_pct,
+                errors: d.io_errors, new_errors, util_pct: d.util_pct,
             });
         }
     }
@@ -498,7 +503,16 @@ fn draw_device_table(
         }.style(theme::bold(theme::FG));
 
         let mut rows: Vec<Row> = devs.iter().enumerate().map(|(i, d)| {
-            let es = if d.errors > 0 { Style::default().fg(theme::RED) } else { Style::default().fg(theme::FG) };
+            // Err cell color: red+bold if errors grew this session (active
+            // failure), dim if non-zero but unchanged (historic), default fg
+            // if zero.
+            let es = if d.new_errors > 0 {
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)
+            } else if d.errors > 0 {
+                theme::dim()
+            } else {
+                Style::default().fg(theme::FG)
+            };
             let uc = if d.util_pct > 80.0 { theme::RED } else if d.util_pct > 50.0 { theme::YELLOW } else { theme::GREEN };
             let util_s = if d.util_pct > 0.0 { format!("{:.0}%", d.util_pct) } else { "\u{2014}".into() };
             let util_cell = Cell::new(util_s).style(Style::default().fg(uc));
@@ -519,17 +533,24 @@ fn draw_device_table(
             }
         }).collect();
         let total_style = theme::bold(theme::CYAN);
+        let total_err_style = if sum_new_errs > 0 {
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)
+        } else if sum_errs > 0 {
+            theme::dim()
+        } else {
+            total_style
+        };
         if has_labels {
             rows.push(Row::new(vec![
                 Cell::new("TOTAL").style(total_style),
                 Cell::new(""),
-                Cell::new(format!("{}", sum_errs)).style(total_style),
+                Cell::new(format!("{}", sum_errs)).style(total_err_style),
                 Cell::new(""),
             ]));
         } else {
             rows.push(Row::new(vec![
                 Cell::new("TOTAL").style(total_style),
-                Cell::new(format!("{}", sum_errs)).style(total_style),
+                Cell::new(format!("{}", sum_errs)).style(total_err_style),
                 Cell::new(""),
             ]));
         }

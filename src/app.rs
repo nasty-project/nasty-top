@@ -75,6 +75,10 @@ pub struct App {
     pub show_help: bool,
     /// Scroll offset for counter/time stats/process views.
     pub view_scroll: usize,
+    /// Per-device io_errors value when first observed in this session.
+    /// Used to color the Err cell: matching baseline = historic (dim),
+    /// growing = active (red).
+    pub initial_errors: std::collections::HashMap<String, u64>,
 }
 
 impl App {
@@ -82,6 +86,9 @@ impl App {
         let fs = all_fs[fs_index].clone();
         let snap = sysfs::snapshot(&fs);
         let tuning = TuningState::new(&snap.options);
+        let initial_errors = snap.devices.iter()
+            .map(|d| (d.name.clone(), d.io_errors))
+            .collect();
         Self {
             fs,
             current: snap,
@@ -112,6 +119,7 @@ impl App {
             view_scroll: 0,
             dismissed_temp: Vec::new(),
             dismissed_permanent: std::collections::HashSet::new(),
+            initial_errors,
         }
     }
 
@@ -122,6 +130,12 @@ impl App {
         self.last_tick = now;
 
         let new_snap = sysfs::snapshot(&self.fs);
+
+        // Baseline error counts for any newly-appearing devices so we
+        // don't flag pre-existing errors on a device added mid-session.
+        for d in &new_snap.devices {
+            self.initial_errors.entry(d.name.clone()).or_insert(d.io_errors);
+        }
 
         // Compute rates from previous snapshot
         let rates = metrics::compute_rates(&self.current, &new_snap, dt);
@@ -344,6 +358,9 @@ impl App {
         self.fs = self.all_fs[self.fs_index].clone();
         let snap = sysfs::snapshot(&self.fs);
         self.tuning = TuningState::new(&snap.options);
+        self.initial_errors = snap.devices.iter()
+            .map(|d| (d.name.clone(), d.io_errors))
+            .collect();
         self.current = snap;
         self.previous = None;
         self.rates = None;

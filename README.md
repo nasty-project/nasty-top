@@ -20,6 +20,7 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Multi-filesystem support** — press `f` to cycle between mounted bcachefs filesystems
 - **Process IO view** showing which processes are doing IO
 - **Journal fill %**, load average, reconcile progress
+- **Session-aware error counts**: the device Err column dims pre-existing counts and turns bold red only when errors grow during the current run — so you can tell at a glance whether a number is dead history or actively climbing
 - **Consistent color scheme**: yellow = read, blue = write, red = errors/stalls
 
 ## Install
