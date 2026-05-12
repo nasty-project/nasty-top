@@ -6,12 +6,8 @@ use std::collections::HashMap;
 /// Computed rates between two snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct Rates {
-    /// Counter rates (value/sec).
-    pub counters: HashMap<String, f64>,
     /// Per-device IO rates.
     pub devices: Vec<DeviceRate>,
-    /// Interval in seconds between snapshots.
-    pub interval_secs: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -50,7 +46,7 @@ impl History {
     }
 
     pub fn push(&mut self, key: &str, value: f64) {
-        let buf = self.series.entry(key.to_string()).or_insert_with(Vec::new);
+        let buf = self.series.entry(key.to_string()).or_default();
         if buf.len() >= self.capacity {
             buf.remove(0);
         }
@@ -66,14 +62,6 @@ impl History {
 pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
     if dt <= 0.0 {
         return Rates::default();
-    }
-
-    let mut counters = HashMap::new();
-    for (key, &curr_val) in &curr.counters {
-        if let Some(&prev_val) = prev.counters.get(key) {
-            let delta = curr_val.saturating_sub(prev_val);
-            counters.insert(key.clone(), delta as f64 / dt);
-        }
     }
 
     let mut devices = Vec::new();
@@ -119,11 +107,7 @@ pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
         });
     }
 
-    Rates {
-        counters,
-        devices,
-        interval_secs: dt,
-    }
+    Rates { devices }
 }
 
 #[derive(Debug, Clone)]

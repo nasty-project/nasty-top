@@ -182,9 +182,9 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     let left_col_width: u16 = if has_labels { 25 } else { 20 };
 
     let dev_count = if app.show_counters {
-        app.counter_deltas.len().min(30).max(10)
+        app.counter_deltas.len().clamp(10, 30)
     } else if app.show_blocked {
-        app.time_stats_view.len().min(30).max(10)
+        app.time_stats_view.len().clamp(10, 30)
     } else if app.show_processes {
         20
     } else {
@@ -311,6 +311,7 @@ fn draw_system_panel(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
     render_gauge(f, rows[5], " Dsk", space_pct, theme::dim());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_io_chart(
     f: &mut Frame,
     app: &App,

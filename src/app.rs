@@ -71,7 +71,6 @@ pub struct App {
     pub show_help: bool,
     /// Scroll offset for counter/time stats/process views.
     pub view_scroll: usize,
-    pub verbose_devices: bool,
 }
 
 impl App {
@@ -108,7 +107,6 @@ impl App {
             view_scroll: 0,
             dismissed_temp: Vec::new(),
             dismissed_permanent: std::collections::HashSet::new(),
-            verbose_devices: false,
         }
     }
 

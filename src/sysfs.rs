@@ -1,6 +1,5 @@
 //! bcachefs discovery and sysfs reading.
 
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -35,37 +34,20 @@ pub struct DeviceInfo {
     pub diskstats_writes: u64,
 }
 
-/// Time stat entry from time_stats_json.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct TimeStat {
-    #[serde(default)]
-    pub count: u64,
-    #[serde(default, alias = "average_duration")]
-    pub mean_ns: u64,
-    #[serde(default, alias = "min")]
-    pub min_ns: u64,
-    #[serde(default, alias = "max")]
-    pub max_ns: u64,
-}
-
 /// Full time_stats entry from JSON.
 #[derive(Debug, Clone, Default)]
 pub struct TimeStatFull {
     pub name: String,
     pub count: u64,
-    pub dur_min_ns: u64,
     pub dur_max_ns: u64,
     pub dur_mean_ns: u64,
     pub dur_recent_ns: u64,
-    pub dur_stddev_ns: u64,
-    pub dur_recent_stddev_ns: u64,
 }
 
 /// Snapshot of all metrics for one filesystem at one point in time.
 #[derive(Debug, Clone, Default)]
 pub struct FsSnapshot {
     pub counters: HashMap<String, u64>,
-    pub time_stats: HashMap<String, TimeStat>,
     /// Key latencies from time_stats "recent" column.
     pub recent_data_read_us: f64,
     pub recent_data_write_us: f64,
@@ -74,8 +56,6 @@ pub struct FsSnapshot {
     pub blocked_stats: Vec<(String, u64, f64)>,
     /// All time_stats from JSON: full detail per operation.
     pub all_time_stats: Vec<TimeStatFull>,
-    /// Compression: (compressed_bytes, uncompressed_bytes).
-    pub compression: (u64, u64),
     pub devices: Vec<DeviceInfo>,
     pub space_total: u64,
     pub space_used: u64,
@@ -188,34 +168,39 @@ fn read_dev_name(dev_dir: &Path) -> Option<String> {
 
 /// Read all metrics for a filesystem.
 pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
-    let mut snap = FsSnapshot::default();
-    snap.counters = read_counters(&fs.sysfs);
-    snap.time_stats = read_time_stats(&fs.sysfs);
-
-    // Extract key recent latencies
-    snap.recent_data_read_us = read_recent_mean_us(&fs.sysfs, "data_read");
-    snap.recent_data_write_us = read_recent_mean_us(&fs.sysfs, "data_write");
-    snap.recent_btree_read_us = read_recent_mean_us(&fs.sysfs, "btree_node_read");
     let (iowait, cpu_total) = read_cpu_iowait();
-    snap.cpu_iowait = iowait;
-    snap.cpu_total = cpu_total;
-    snap.blocked_stats = read_blocked_stats(&fs.sysfs);
-    snap.compression = read_compression_stats(&fs.sysfs);
-    snap.all_time_stats = read_all_time_stats_json(&fs.sysfs);
-    snap.devices = read_devices(&fs.sysfs);
-    snap.options = read_options(&fs.sysfs);
-    snap.background = read_background(&fs.sysfs, &fs.mount_point);
-    let (jf, jw) = read_journal_fill(&fs.sysfs);
-    snap.journal_fill = jf;
-    snap.journal_watermark = jw;
+    let (journal_fill, journal_watermark) = read_journal_fill(&fs.sysfs);
 
-    // Space via statvfs
-    if let Ok(stat) = nix::sys::statvfs::statvfs(fs.mount_point.as_str()) {
-        snap.space_total = stat.blocks() as u64 * stat.fragment_size() as u64;
-        snap.space_used = snap.space_total - stat.blocks_available() as u64 * stat.fragment_size() as u64;
+    // Space via statvfs. fsblkcnt_t / c_ulong width varies across targets,
+    // so the casts are intentionally kept; clippy sees them as redundant on
+    // the build host.
+    #[allow(clippy::unnecessary_cast)]
+    let (space_total, space_used) = match nix::sys::statvfs::statvfs(fs.mount_point.as_str()) {
+        Ok(stat) => {
+            let total = stat.blocks() as u64 * stat.fragment_size() as u64;
+            let avail = stat.blocks_available() as u64 * stat.fragment_size() as u64;
+            (total, total.saturating_sub(avail))
+        }
+        Err(_) => (0, 0),
+    };
+
+    FsSnapshot {
+        counters: read_counters(&fs.sysfs),
+        recent_data_read_us: read_recent_mean_us(&fs.sysfs, "data_read"),
+        recent_data_write_us: read_recent_mean_us(&fs.sysfs, "data_write"),
+        recent_btree_read_us: read_recent_mean_us(&fs.sysfs, "btree_node_read"),
+        blocked_stats: read_blocked_stats(&fs.sysfs),
+        all_time_stats: read_all_time_stats_json(&fs.sysfs),
+        devices: read_devices(&fs.sysfs),
+        space_total,
+        space_used,
+        options: read_options(&fs.sysfs),
+        background: read_background(&fs.sysfs, &fs.mount_point),
+        cpu_iowait: iowait,
+        cpu_total,
+        journal_fill,
+        journal_watermark,
     }
-
-    snap
 }
 
 fn read_counters(sysfs: &Path) -> HashMap<String, u64> {
@@ -236,48 +221,11 @@ fn read_dir_u64_files(dir: &Path) -> HashMap<String, u64> {
             let val = content.trim().parse::<u64>().unwrap_or_else(|_| {
                 content.lines()
                     .find(|l| l.contains("since mount"))
-                    .and_then(|l| l.split(':').last())
+                    .and_then(|l| l.split(':').next_back())
                     .and_then(|v| v.trim().parse().ok())
                     .unwrap_or(0)
             });
             map.insert(name, val);
-        }
-    }
-    map
-}
-
-fn read_time_stats(sysfs: &Path) -> HashMap<String, TimeStat> {
-    let dir = sysfs.join("time_stats");
-    let mut map = HashMap::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return map,
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Ok(content) = std::fs::read_to_string(entry.path()) {
-            // time_stats files have a key: value format per line
-            let mut stat = TimeStat::default();
-            for line in content.lines() {
-                let parts: Vec<&str> = line.splitn(2, ':').collect();
-                if parts.len() != 2 {
-                    continue;
-                }
-                let key = parts[0].trim();
-                let val_str = parts[1].trim().split_whitespace().next().unwrap_or("0");
-                let val: u64 = val_str.parse().unwrap_or(0);
-                match key {
-                    "count" => stat.count = val,
-                    "rate" => {} // skip
-                    _ if key.contains("mean") || key.contains("average") || key.contains("avg") => {
-                        stat.mean_ns = val;
-                    }
-                    _ if key.contains("min") => stat.min_ns = val,
-                    _ if key.contains("max") => stat.max_ns = val,
-                    _ => {}
-                }
-            }
-            map.insert(name, stat);
         }
     }
     map
@@ -377,12 +325,11 @@ fn natural_key(s: &str) -> Vec<NatToken> {
 fn read_latency_ns(dev_path: &Path, direction: &str) -> u64 {
     // Prefer the EWMA from the JSON stats — this is actual recent latency
     let json_path = dev_path.join(format!("io_latency_stats_{direction}_json"));
-    if let Ok(content) = std::fs::read_to_string(&json_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(ewma) = json["duration_ewma_ns"]["mean"].as_u64() {
-                return ewma;
-            }
-        }
+    if let Ok(content) = std::fs::read_to_string(&json_path)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(ewma) = json["duration_ewma_ns"]["mean"].as_u64()
+    {
+        return ewma;
     }
     // Fallback: cumulative mean (not great but better than nothing)
     let path = dev_path.join(format!("io_latency_{direction}"));
@@ -483,7 +430,7 @@ fn read_background(sysfs: &Path, mount_point: &str) -> Vec<(String, String)> {
         // Try multiple status file names (varies by kernel version)
         let status_names = [
             format!("{prefix}_status"),
-            format!("copy_gc_wait"),
+            "copy_gc_wait".to_string(),
         ];
         let mut status = String::new();
         for name in &status_names {
@@ -491,7 +438,7 @@ fn read_background(sysfs: &Path, mount_point: &str) -> Vec<(String, String)> {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let running = content.lines()
                     .find(|l| l.trim().starts_with("running:"))
-                    .and_then(|l| l.split(':').last())
+                    .and_then(|l| l.split(':').next_back())
                     .map(|v| v.trim() == "1")
                     .unwrap_or(false);
 
@@ -617,12 +564,9 @@ fn read_all_time_stats_json(sysfs: &Path) -> Vec<TimeStatFull> {
         result.push(TimeStatFull {
             name,
             count,
-            dur_min_ns: json["duration_ns"]["min"].as_u64().unwrap_or(0),
             dur_max_ns: json["duration_ns"]["max"].as_u64().unwrap_or(0),
             dur_mean_ns: json["duration_ns"]["mean"].as_u64().unwrap_or(0),
             dur_recent_ns: json["duration_ewma_ns"]["mean"].as_u64().unwrap_or(0),
-            dur_stddev_ns: json["duration_ns"]["stddev"].as_u64().unwrap_or(0),
-            dur_recent_stddev_ns: json["duration_ewma_ns"]["stddev"].as_u64().unwrap_or(0),
         });
     }
     result.sort_by(|a, b| a.name.cmp(&b.name));
@@ -688,43 +632,6 @@ fn read_blocked_stats(sysfs: &Path) -> Vec<(String, u64, f64)> {
     result
 }
 
-/// Read compression stats from compression_stats sysfs file.
-/// Returns (compressed_bytes, uncompressed_bytes).
-fn read_compression_stats(sysfs: &Path) -> (u64, u64) {
-    let path = sysfs.join("compression_stats");
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut compressed = 0u64;
-    let mut uncompressed = 0u64;
-    for line in content.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        // Format: "zstd    54.5G    58.1G    490k"
-        //         "incompressible  224G  224G  212k"
-        if tokens.len() >= 3 && tokens[0] != "typetype" {
-            compressed += parse_size(tokens[1]);
-            uncompressed += parse_size(tokens[2]);
-        }
-    }
-    (compressed, uncompressed)
-}
-
-fn parse_size(s: &str) -> u64 {
-    let s = s.trim();
-    if s == "0" { return 0; }
-    let (num_str, mult) = if let Some(n) = s.strip_suffix('k') {
-        (n, 1_000u64)
-    } else if let Some(n) = s.strip_suffix('M') {
-        (n, 1_000_000)
-    } else if let Some(n) = s.strip_suffix('G') {
-        (n, 1_000_000_000)
-    } else if let Some(n) = s.strip_suffix('T') {
-        (n, 1_000_000_000_000)
-    } else {
-        (s, 1)
-    };
-    let val: f64 = num_str.parse().unwrap_or(0.0);
-    (val * mult as f64) as u64
-}
-
 /// Read journal fill from internal/journal_debug.
 fn read_journal_fill(sysfs: &Path) -> ((u64, u64), String) {
     let path = sysfs.join("internal").join("journal_debug");
@@ -766,14 +673,6 @@ fn read_reconcile_status(mount_point: &str) -> String {
         .and_then(|l| l.split_whitespace().last())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-
-    // Sum all non-zero "pending:" row values
-    let pending_work: u64 = output
-        .lines()
-        .filter(|l| l.trim().starts_with("pending:"))
-        .flat_map(|l| l.split_whitespace().skip(1))
-        .filter_map(|v| v.parse::<u64>().ok())
-        .sum();
 
     // Detect state from the output
     let state = if output.contains("processing") {
