@@ -906,11 +906,26 @@ fn draw_blocked_table(f: &mut Frame, app: &App, area: Rect, border_style: Style)
 }
 
 fn draw_process_table(f: &mut Frame, app: &App, area: Rect, border_style: Style) {
-    let block = Block::default()
+    let mut block = Block::default()
         .title(Span::styled(" Processes (by I/O) ", theme::bold(theme::ACCENT)))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style);
+
+    // bcachefs writeback / GC / btree submit_bio paths don't hit
+    // task_io_account_write(), so device-level writes can exceed the sum of
+    // per-process write_bytes. Surface that gap so the panel isn't misleading.
+    let dev_write: f64 = app.rates.as_ref()
+        .map(|r| r.devices.iter().map(|d| d.write_bytes_sec).sum())
+        .unwrap_or(0.0);
+    let proc_write: f64 = app.process_rates.iter().map(|p| p.write_bytes_sec).sum();
+    let unaccounted = dev_write - proc_write;
+    if unaccounted >= 1_000_000.0 {
+        let hint = format!(" kernel writes (unaccounted): {} ", format_bytes(unaccounted));
+        block = block.title_bottom(
+            Line::from(Span::styled(hint, Style::default().fg(theme::WRITE))).right_aligned(),
+        );
+    }
 
     let header = Row::new(vec!["PID", "Process", "Read/s", "Write/s", "Rate", "Total"])
         .style(theme::bold(theme::FG));
