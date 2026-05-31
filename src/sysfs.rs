@@ -76,7 +76,11 @@ pub struct FsSnapshot {
 /// Deduplicates by UUID, keeping the first mount (original, not bind mounts).
 /// Uses filesystem label for the name if set, otherwise the mount point basename.
 pub fn discover() -> Vec<BcachefsFs> {
-    // Build a map of device -> (mount_point, first occurrence order) from /proc/mounts
+    // Build a map of device -> mount_point from /proc/mounts. Every member
+    // of a multi-device mount goes in, not just the first — bcachefs's
+    // sysfs `dev-N` entries don't necessarily list devices in the same
+    // order /proc/mounts does, and `find_mount_for_uuid` returns on the
+    // first sysfs entry that matches *any* live device path.
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     let mut dev_to_mount: HashMap<String, String> = HashMap::new();
     for line in mounts.lines() {
@@ -84,10 +88,14 @@ pub fn discover() -> Vec<BcachefsFs> {
         if parts.len() < 3 || parts[2] != "bcachefs" {
             continue;
         }
-        // For multi-device, parts[0] is "dev1:dev2:..."; take first device
-        let first_dev = parts[0].split(':').next().unwrap_or("").to_string();
-        // First mount wins — bind mounts appear later in /proc/mounts
-        dev_to_mount.entry(first_dev).or_insert_with(|| parts[1].to_string());
+        // For multi-device, parts[0] is "dev1:dev2:..." — register every
+        // member so a UUID's sysfs lookup can match any of them. First
+        // mount wins per device — bind mounts appear later in /proc/mounts.
+        for dev in parts[0].split(':') {
+            dev_to_mount
+                .entry(dev.to_string())
+                .or_insert_with(|| parts[1].to_string());
+        }
     }
 
     let mut result = Vec::new();
@@ -135,23 +143,35 @@ pub fn discover() -> Vec<BcachefsFs> {
 
 /// Find a mount point for a bcachefs UUID by matching its member devices
 /// against the device->mount map from /proc/mounts.
+///
+/// bcachefs's sysfs entries for member devices are named `dev-N` where N
+/// is the internal device index assigned at format / `device add` time —
+/// NOT a contiguous range starting from 0. After device removal or any
+/// add/remove cycling the live set can be `dev-2 dev-3 dev-4 dev-5 dev-6`
+/// (issue #11): the previous implementation probed `dev-0..64` and
+/// `break`ed on the first missing entry, so on any FS without `dev-0` it
+/// returned no match → empty mount_point → 0/0 capacity in the top bar
+/// and no fallback could recover it (every code path that reads the FS
+/// is keyed on the mount point).
+///
+/// Enumerate the actual `dev-*` entries via `read_dir` so the lookup is
+/// correct regardless of how bcachefs numbered the devices.
 fn find_mount_for_uuid(sysfs: &Path, dev_to_mount: &HashMap<String, String>) -> Option<String> {
-    let dev_dir = sysfs.join("dev-0");
-    // Read the actual block device name from sysfs
-    if dev_dir.is_dir() {
-        // Try all dev-N entries
-        for i in 0..64 {
-            let dev_n = sysfs.join(format!("dev-{i}"));
-            if !dev_n.is_dir() {
-                break;
-            }
-            // The dev-N directory is a symlink or contains info; read the block device
-            // by checking what block device it points to
-            if let Some(dev_name) = read_dev_name(&dev_n) {
-                let dev_path = format!("/dev/{dev_name}");
-                if let Some(mp) = dev_to_mount.get(&dev_path) {
-                    return Some(mp.clone());
-                }
+    let entries = std::fs::read_dir(sysfs).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("dev-") {
+            continue;
+        }
+        let dev_n = entry.path();
+        if !dev_n.is_dir() {
+            continue;
+        }
+        if let Some(dev_name) = read_dev_name(&dev_n) {
+            let dev_path = format!("/dev/{dev_name}");
+            if let Some(mp) = dev_to_mount.get(&dev_path) {
+                return Some(mp.clone());
             }
         }
     }
