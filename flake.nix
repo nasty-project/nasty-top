@@ -24,7 +24,15 @@
             pname = "nasty-top";
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = ./.;
-            cargoHash = "sha256-3HzzaLC6Cvr/n+v9VSmpVDsS1X6WwvOAXiFxuwibKlg=";
+            # Vendor deps via Cargo.lock instead of carrying a separate
+            # cargoHash. cargoHash hashes the full `cargo vendor` tarball,
+            # so any `cargo update` shifts it and downstream packagers
+            # (#16, nasty's nasty.nix #362) discover this only when their
+            # build breaks. cargoLock.lockFile has Nix synthesize one
+            # fetchurl per crate keyed on the SHA Cargo itself already
+            # wrote into Cargo.lock — zero hash to maintain across
+            # releases, no drift possible.
+            cargoLock.lockFile = ./Cargo.lock;
             meta = {
               description = "A top-like TUI for bcachefs filesystems";
               homepage = "https://github.com/nasty-project/nasty-top";
