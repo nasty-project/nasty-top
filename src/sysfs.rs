@@ -171,18 +171,7 @@ pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
     let (iowait, cpu_total) = read_cpu_iowait();
     let (journal_fill, journal_watermark) = read_journal_fill(&fs.sysfs);
 
-    // Space via statvfs. fsblkcnt_t / c_ulong width varies across targets,
-    // so the casts are intentionally kept; clippy sees them as redundant on
-    // the build host.
-    #[allow(clippy::unnecessary_cast)]
-    let (space_total, space_used) = match nix::sys::statvfs::statvfs(fs.mount_point.as_str()) {
-        Ok(stat) => {
-            let total = stat.blocks() as u64 * stat.fragment_size() as u64;
-            let avail = stat.blocks_available() as u64 * stat.fragment_size() as u64;
-            (total, total.saturating_sub(avail))
-        }
-        Err(_) => (0, 0),
-    };
+    let (space_total, space_used) = read_fs_space(&fs.mount_point);
 
     FsSnapshot {
         counters: read_counters(&fs.sysfs),
@@ -656,13 +645,74 @@ fn read_journal_fill(sysfs: &Path) -> ((u64, u64), String) {
     ((dirty, total), watermark)
 }
 
+/// Skip the CONFIG_RUST warning + continuation line that bcachefs CLI
+/// prints when the running kernel lacks `CONFIG_RUST`. Most builds put
+/// it on stderr (so capturing only stdout is enough), but it's been
+/// seen on stdout on at least some builds — defensive filter so the
+/// warning can never silently corrupt our parsers.
+fn skip_bcachefs_warning(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("WARNING:") || t.starts_with("please alert")
+}
+
+/// Read `(total_bytes, used_bytes)` for a mounted bcachefs filesystem.
+///
+/// Fast path is `statvfs`. Some kernels' bcachefs statvfs implementation
+/// returns 0 blocks for multi-device filesystems (issue #12), so on a
+/// zero reading we fall back to parsing `bcachefs fs usage` — slower
+/// (spawns a process) but authoritative whenever the CLI works.
+fn read_fs_space(mount_point: &str) -> (u64, u64) {
+    // fsblkcnt_t / c_ulong width varies across targets; the casts are
+    // intentionally kept (clippy sees them as redundant on the build host).
+    #[allow(clippy::unnecessary_cast)]
+    if let Ok(stat) = nix::sys::statvfs::statvfs(mount_point) {
+        let total = stat.blocks() as u64 * stat.fragment_size() as u64;
+        if total > 0 {
+            let avail = stat.blocks_available() as u64 * stat.fragment_size() as u64;
+            return (total, total.saturating_sub(avail));
+        }
+    }
+    bcachefs_fs_usage_space(mount_point)
+}
+
+/// Fallback for `read_fs_space` when statvfs reports zero. Runs
+/// `bcachefs fs usage <mount>` (no `-h` → raw bytes) and pulls the
+/// top-level `Size:` / `Used:` lines.
+fn bcachefs_fs_usage_space(mount_point: &str) -> (u64, u64) {
+    let output = match std::process::Command::new("bcachefs")
+        .args(["fs", "usage", mount_point])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return (0, 0),
+    };
+    let mut total: u64 = 0;
+    let mut used: u64 = 0;
+    for line in output.lines() {
+        if skip_bcachefs_warning(line) {
+            continue;
+        }
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("Size:") {
+            total = rest.trim().parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("Used:") {
+            used = rest.trim().parse().unwrap_or(0);
+        }
+    }
+    (total, used)
+}
+
 /// Parse `bcachefs reconcile status <mount>` into a one-line summary.
 fn read_reconcile_status(mount_point: &str) -> String {
     let output = match std::process::Command::new("bcachefs")
         .args(["reconcile", "status", mount_point])
         .output()
     {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !skip_bcachefs_warning(l))
+            .collect::<Vec<_>>()
+            .join("\n"),
         Err(_) => return "n/a".into(),
     };
 

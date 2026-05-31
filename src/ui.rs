@@ -1024,9 +1024,26 @@ fn read_uptime() -> String {
 fn read_loadavg_parts() -> (String, String, String) {
     let content = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     let mut parts = content.split_whitespace();
-    (
-        parts.next().unwrap_or("?").to_string(),
-        parts.next().unwrap_or("?").to_string(),
-        parts.next().unwrap_or("?").to_string(),
-    )
+    let raw = [
+        parts.next().unwrap_or("?"),
+        parts.next().unwrap_or("?"),
+        parts.next().unwrap_or("?"),
+    ];
+    // Heavy-load hosts (issue #12) print load averages like "56.65" —
+    // three of those plus the " │ " separators don't fit in the narrow
+    // System panel and the 15-min value gets clipped. Drop the decimals
+    // when any of the three is ≥ 10 so the column stays legible at the
+    // cost of two digits of precision (load >= 10 is already the kind
+    // of number you read at a glance, not to two decimals).
+    let high_load = raw
+        .iter()
+        .any(|s| s.split('.').next().is_some_and(|i| i.len() > 1));
+    let fmt = |s: &str| -> String {
+        if high_load {
+            s.split('.').next().unwrap_or(s).to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    (fmt(raw[0]), fmt(raw[1]), fmt(raw[2]))
 }
