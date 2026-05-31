@@ -10,8 +10,11 @@ pub const BG: Color = Color::Rgb(20, 20, 30);
 /// Primary text.
 pub const FG: Color = Color::Rgb(200, 200, 210);
 
-/// Dim/inactive text.
-pub const DIM: Color = Color::Rgb(80, 80, 100);
+/// Dim/inactive text. Bright enough to keep ≥4.5:1 contrast against both
+/// `BG` and `ROW_ALT` (WCAG AA for body text) — the previous (80,80,100)
+/// dropped to ~2:1 on alternating rows and went invisible after 256-color
+/// quantization on screen / vt100 palettes (issue #11).
+pub const DIM: Color = Color::Rgb(140, 140, 160);
 
 /// Bright accent for selected items.
 pub const ACCENT: Color = Color::Rgb(100, 220, 240);
@@ -51,8 +54,12 @@ pub const ORANGE: Color = Color::Rgb(240, 150, 50);
 /// Cyan for totals/summaries.
 pub const CYAN: Color = Color::Rgb(80, 200, 220);
 
-/// Alternating row background tint.
-pub const ROW_ALT: Color = Color::Rgb(28, 28, 40);
+/// Alternating row background tint. Slightly brighter than the previous
+/// (28,28,40) so the zebra effect survives 256-color quantization on
+/// terminals that collapse near-identical shades to the same palette
+/// index — the old value was indistinguishable from `BG` outside of
+/// truecolor (issue #11).
+pub const ROW_ALT: Color = Color::Rgb(35, 35, 50);
 
 /// Header bar background.
 pub const HEADER_BG: Color = Color::Rgb(30, 35, 50);
