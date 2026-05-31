@@ -24,7 +24,7 @@
             pname = "nasty-top";
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = ./.;
-            cargoHash = "sha256-d1gVWeQMLx03/qE62qY4Yk+Xqa/bWfdpIg8sjV4XX50=";
+            cargoHash = "sha256-3HzzaLC6Cvr/n+v9VSmpVDsS1X6WwvOAXiFxuwibKlg=";
             meta = {
               description = "A top-like TUI for bcachefs filesystems";
               homepage = "https://github.com/nasty-project/nasty-top";
