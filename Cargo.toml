@@ -1,6 +1,6 @@
 [package]
 name = "nasty-top"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "A top-like TUI for bcachefs filesystems"
