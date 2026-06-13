@@ -118,6 +118,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .get("compression")
         .map(|s| s.as_str())
         .unwrap_or("none");
+    let bg_compression = snap
+        .options
+        .get("background_compression")
+        .map(|s| s.as_str())
+        .unwrap_or("none");
+    // Show background compression only when it's set and differs from
+    // foreground, e.g. "lz4→zstd" for fast-SSD + recompress-to-spinner setups.
+    let compression = if bg_compression != "none" && bg_compression != compression {
+        format!("{compression}→{bg_compression}")
+    } else {
+        compression.to_string()
+    };
 
     let fs_indicator = if app.all_fs.len() > 1 {
         format!(" [{}/{}]", app.fs_index + 1, app.all_fs.len())
