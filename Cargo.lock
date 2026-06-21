@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "nasty-top"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "clap",
  "crossterm",
