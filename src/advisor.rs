@@ -29,9 +29,14 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
 
     // Rule 1: Journal fill > 80% → lower journal_reclaim_delay
     let (jdirty, jtotal) = app.current.journal_fill;
-    let jpct = if jtotal > 0 { jdirty as f64 / jtotal as f64 * 100.0 } else { 0.0 };
+    let jpct = if jtotal > 0 {
+        jdirty as f64 / jtotal as f64 * 100.0
+    } else {
+        0.0
+    };
     if jpct > 80.0 {
-        let current: u64 = opts.get("journal_reclaim_delay")
+        let current: u64 = opts
+            .get("journal_reclaim_delay")
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
         if current > 10 {
@@ -46,13 +51,17 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
 
     // Rule 2: Journal fill > 50% with watermark not "normal" → lower flush delay
     if jpct > 50.0 && app.current.journal_watermark != "stripe" {
-        let current: u64 = opts.get("journal_flush_delay")
+        let current: u64 = opts
+            .get("journal_flush_delay")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1000);
         if current > 100 {
             let new_val = (current / 2).max(100);
             return Some(Proposal {
-                reason: format!("Journal {:.0}% full (watermark: {}) — flush more often", jpct, app.current.journal_watermark),
+                reason: format!(
+                    "Journal {:.0}% full (watermark: {}) — flush more often",
+                    jpct, app.current.journal_watermark
+                ),
                 option: "journal_flush_delay".into(),
                 command: format!("echo {} > {}/journal_flush_delay", new_val, sysfs_base),
             });
@@ -61,21 +70,39 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
 
     // Helper: check if a blocked counter is actively increasing (not just historical)
     let blocked_delta = |name: &str| -> Option<(u64, f64)> {
-        let curr = app.current.blocked_stats.iter().find(|(n, _, _)| n == name)?;
-        let prev = app.previous.as_ref()?.blocked_stats.iter().find(|(n, _, _)| n == name)?;
+        let curr = app
+            .current
+            .blocked_stats
+            .iter()
+            .find(|(n, _, _)| n == name)?;
+        let prev = app
+            .previous
+            .as_ref()?
+            .blocked_stats
+            .iter()
+            .find(|(n, _, _)| n == name)?;
         let delta = curr.1.saturating_sub(prev.1);
-        if delta > 0 { Some((delta, curr.2)) } else { None }
+        if delta > 0 {
+            Some((delta, curr.2))
+        } else {
+            None
+        }
     };
 
     // Rule 2b: blocked_journal_low_on_space actively increasing → lower journal_flush_delay
     if let Some((delta, recent_us)) = blocked_delta("journal_low_on_space") {
-        let current: u64 = opts.get("journal_flush_delay")
+        let current: u64 = opts
+            .get("journal_flush_delay")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1000);
         if current > 100 {
             let new_val = (current / 2).max(100);
             return Some(Proposal {
-                reason: format!("journal_low_on_space +{} blocks (mean {:.1}ms)", delta, recent_us / 1000.0),
+                reason: format!(
+                    "journal_low_on_space +{} blocks (mean {:.1}ms)",
+                    delta,
+                    recent_us / 1000.0
+                ),
                 option: "journal_flush_delay".into(),
                 command: format!("echo {} > {}/journal_flush_delay", new_val, sysfs_base),
             });
@@ -84,13 +111,18 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
 
     // Rule 2c: blocked_write_buffer_full actively increasing → lower journal_flush_delay
     if let Some((delta, recent_us)) = blocked_delta("write_buffer_full") {
-        let current: u64 = opts.get("journal_flush_delay")
+        let current: u64 = opts
+            .get("journal_flush_delay")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1000);
         if current > 100 {
             let new_val = (current / 2).max(100);
             return Some(Proposal {
-                reason: format!("write_buffer_full +{} blocks (mean {:.1}ms)", delta, recent_us / 1000.0),
+                reason: format!(
+                    "write_buffer_full +{} blocks (mean {:.1}ms)",
+                    delta,
+                    recent_us / 1000.0
+                ),
                 option: "journal_flush_delay".into(),
                 command: format!("echo {} > {}/journal_flush_delay", new_val, sysfs_base),
             });
@@ -99,13 +131,18 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
 
     // Rule 2d: blocked_allocate actively increasing → increase gc_reserve_percent
     if let Some((delta, recent_us)) = blocked_delta("allocate") {
-        let gc_pct: u64 = opts.get("gc_reserve_percent")
+        let gc_pct: u64 = opts
+            .get("gc_reserve_percent")
             .and_then(|v| v.parse().ok())
             .unwrap_or(8);
         if gc_pct < 20 {
             let new_val = (gc_pct + 4).min(20);
             return Some(Proposal {
-                reason: format!("allocate +{} blocks (mean {:.1}ms)", delta, recent_us / 1000.0),
+                reason: format!(
+                    "allocate +{} blocks (mean {:.1}ms)",
+                    delta,
+                    recent_us / 1000.0
+                ),
                 option: "gc_reserve_percent".into(),
                 command: format!("echo {} > {}/gc_reserve_percent", new_val, sysfs_base),
             });
@@ -113,21 +150,56 @@ fn evaluate_inner(app: &App) -> Option<Proposal> {
     }
 
     // Rule 3: Write stalls while copygc is running → disable copygc
-    let copygc_on = opts.get("copygc_enabled").map(|v| v == "1").unwrap_or(false);
-    let has_write_stalls = app.stall_events.iter().any(|e| {
-        e.direction == "write" && e.time.elapsed().as_secs() < 60
-    });
-    if has_write_stalls && copygc_on {
-        let copygc_active = app.current.background.iter()
-            .any(|(k, v)| k == "copygc" && v.contains("on"));
-        if copygc_active {
-            return Some(Proposal {
-                reason: "Write stalls while copygc active — disable copygc".into(),
-                option: "copygc_enabled".into(),
-                command: format!("echo 0 > {}/copygc_enabled", sysfs_base),
-            });
-        }
+    let copygc_on = opts
+        .get("copygc_enabled")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let has_write_stalls = app
+        .stall_events
+        .iter()
+        .any(|e| e.direction == "write" && e.time.elapsed().as_secs() < 60);
+    if should_disable_copygc(copygc_on, has_write_stalls, &app.current.background) {
+        return Some(Proposal {
+            reason: "Write stalls while copygc active — disable copygc".into(),
+            option: "copygc_enabled".into(),
+            command: format!("echo 0 > {}/copygc_enabled", sysfs_base),
+        });
     }
 
     None
+}
+
+fn operation_is_working(background: &[(String, String)], operation: &str) -> bool {
+    background
+        .iter()
+        .any(|(name, state)| name == operation && state.starts_with("working"))
+}
+
+fn should_disable_copygc(
+    copygc_enabled: bool,
+    has_recent_write_stalls: bool,
+    background: &[(String, String)],
+) -> bool {
+    copygc_enabled && has_recent_write_stalls && operation_is_working(background, "copygc")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copygc_hint_requires_enabled_working_copygc_and_write_stalls() {
+        for state in ["off", "idle", "enabled"] {
+            let background = vec![("copygc".to_string(), state.to_string())];
+            assert!(!should_disable_copygc(true, true, &background));
+        }
+
+        let background = vec![("copygc".to_string(), "working".to_string())];
+        assert!(should_disable_copygc(true, true, &background));
+        assert!(!should_disable_copygc(false, true, &background));
+        assert!(!should_disable_copygc(true, false, &background));
+
+        let rebalance = vec![("rebalance".to_string(), "working".to_string())];
+        assert!(!should_disable_copygc(true, true, &rebalance));
+    }
 }

@@ -52,6 +52,7 @@ pub struct FsSnapshot {
     pub recent_data_read_us: f64,
     pub recent_data_write_us: f64,
     pub recent_btree_read_us: f64,
+    pub btree_read_count: u64,
     /// Blocked stats: (name, cumulative_count, recent_mean_us).
     pub blocked_stats: Vec<(String, u64, f64)>,
     /// All time_stats from JSON: full detail per operation.
@@ -76,27 +77,11 @@ pub struct FsSnapshot {
 /// Deduplicates by UUID, keeping the first mount (original, not bind mounts).
 /// Uses filesystem label for the name if set, otherwise the mount point basename.
 pub fn discover() -> Vec<BcachefsFs> {
-    // Build a map of device -> mount_point from /proc/mounts. Every member
-    // of a multi-device mount goes in, not just the first — bcachefs's
-    // sysfs `dev-N` entries don't necessarily list devices in the same
-    // order /proc/mounts does, and `find_mount_for_uuid` returns on the
-    // first sysfs entry that matches *any* live device path.
+    // Build a map of mount source -> mount point from /proc/mounts. Legacy
+    // multi-device sources register every member so the sysfs lookup can
+    // match any live device path.
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
-    let mut dev_to_mount: HashMap<String, String> = HashMap::new();
-    for line in mounts.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 || parts[2] != "bcachefs" {
-            continue;
-        }
-        // For multi-device, parts[0] is "dev1:dev2:..." — register every
-        // member so a UUID's sysfs lookup can match any of them. First
-        // mount wins per device — bind mounts appear later in /proc/mounts.
-        for dev in parts[0].split(':') {
-            dev_to_mount
-                .entry(dev.to_string())
-                .or_insert_with(|| parts[1].to_string());
-        }
-    }
+    let source_to_mount = bcachefs_mounts(&mounts);
 
     let mut result = Vec::new();
 
@@ -114,9 +99,9 @@ pub fn discover() -> Vec<BcachefsFs> {
             continue;
         }
 
-        // Find mount point by matching devices listed under this UUID's sysfs
-        let mount_point = find_mount_for_uuid(&sysfs, &dev_to_mount)
-            .unwrap_or_default();
+        // Find mount point from the UUID source used by newer bcachefs, or
+        // fall back to matching the filesystem's member devices.
+        let mount_point = find_mount_for_uuid(&uuid, &sysfs, &source_to_mount).unwrap_or_default();
 
         // Read fs label from sysfs label file if available
         let label = std::fs::read_to_string(sysfs.join("options/label"))
@@ -141,8 +126,28 @@ pub fn discover() -> Vec<BcachefsFs> {
     result
 }
 
-/// Find a mount point for a bcachefs UUID by matching its member devices
-/// against the device->mount map from /proc/mounts.
+fn bcachefs_mounts(mounts: &str) -> HashMap<String, String> {
+    let mut source_to_mount: HashMap<String, String> = HashMap::new();
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 || parts[2] != "bcachefs" {
+            continue;
+        }
+        // For multi-device, parts[0] is "dev1:dev2:..." — register every
+        // member so a UUID's sysfs lookup can match any of them. First
+        // mount wins per device — bind mounts appear later in /proc/mounts.
+        for dev in parts[0].split(':') {
+            source_to_mount
+                .entry(dev.to_string())
+                .or_insert_with(|| parts[1].to_string());
+        }
+    }
+    source_to_mount
+}
+
+/// Find a mount point for a bcachefs UUID from the source in /proc/mounts.
+/// Newer bcachefs versions expose multi-device filesystems as
+/// `/dev/disk/by-uuid/<uuid>`; older versions expose their member devices.
 ///
 /// bcachefs's sysfs entries for member devices are named `dev-N` where N
 /// is the internal device index assigned at format / `device add` time —
@@ -156,7 +161,16 @@ pub fn discover() -> Vec<BcachefsFs> {
 ///
 /// Enumerate the actual `dev-*` entries via `read_dir` so the lookup is
 /// correct regardless of how bcachefs numbered the devices.
-fn find_mount_for_uuid(sysfs: &Path, dev_to_mount: &HashMap<String, String>) -> Option<String> {
+fn find_mount_for_uuid(
+    uuid: &str,
+    sysfs: &Path,
+    source_to_mount: &HashMap<String, String>,
+) -> Option<String> {
+    let uuid_source = format!("/dev/disk/by-uuid/{uuid}");
+    if let Some(mount_point) = source_to_mount.get(&uuid_source) {
+        return Some(mount_point.clone());
+    }
+
     let entries = std::fs::read_dir(sysfs).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -170,12 +184,78 @@ fn find_mount_for_uuid(sysfs: &Path, dev_to_mount: &HashMap<String, String>) -> 
         }
         if let Some(dev_name) = read_dev_name(&dev_n) {
             let dev_path = format!("/dev/{dev_name}");
-            if let Some(mp) = dev_to_mount.get(&dev_path) {
+            if let Some(mp) = source_to_mount.get(&dev_path) {
                 return Some(mp.clone());
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn finds_by_uuid_mount_without_member_device_matching() {
+        let mounts = bcachefs_mounts(
+            "/dev/disk/by-uuid/6ecff1be-9388-482d-a9fd-f1ff6e29a823 /fs/first bcachefs rw 0 0\n",
+        );
+
+        assert_eq!(
+            find_mount_for_uuid(
+                "6ecff1be-9388-482d-a9fd-f1ff6e29a823",
+                Path::new("/nonexistent"),
+                &mounts,
+            ),
+            Some("/fs/first".to_string())
+        );
+    }
+
+    #[test]
+    fn registers_each_legacy_multi_device_source() {
+        let mounts = bcachefs_mounts("/dev/sda:/dev/sdb /fs/pool bcachefs rw 0 0\n");
+
+        assert_eq!(mounts.get("/dev/sda").map(String::as_str), Some("/fs/pool"));
+        assert_eq!(mounts.get("/dev/sdb").map(String::as_str), Some("/fs/pool"));
+    }
+
+    #[test]
+    fn falls_back_to_sparse_member_device_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "nasty-top-sysfs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dev_dir = root.join("dev-7");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        symlink("../../devices/virtual/block/sdb", dev_dir.join("block")).unwrap();
+
+        let mounts = bcachefs_mounts("/dev/sda:/dev/sdb /fs/pool bcachefs rw 0 0\n");
+        assert_eq!(
+            find_mount_for_uuid("example", &root, &mounts),
+            Some("/fs/pool".to_string())
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keeps_first_mount_for_duplicate_sources() {
+        let mounts = bcachefs_mounts(
+            "/dev/disk/by-uuid/example /fs/original bcachefs rw 0 0\n\
+             /dev/disk/by-uuid/example /fs/bind bcachefs rw 0 0\n",
+        );
+
+        assert_eq!(
+            mounts.get("/dev/disk/by-uuid/example").map(String::as_str),
+            Some("/fs/original")
+        );
+    }
 }
 
 /// Read the block device name (e.g. "nvme0n1p1") from a bcachefs sysfs dev-N directory.
@@ -198,6 +278,7 @@ pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
         recent_data_read_us: read_recent_mean_us(&fs.sysfs, "data_read"),
         recent_data_write_us: read_recent_mean_us(&fs.sysfs, "data_write"),
         recent_btree_read_us: read_recent_mean_us(&fs.sysfs, "btree_node_read"),
+        btree_read_count: read_time_stat_count(&fs.sysfs, "btree_node_read"),
         blocked_stats: read_blocked_stats(&fs.sysfs),
         all_time_stats: read_all_time_stats_json(&fs.sysfs),
         devices: read_devices(&fs.sysfs),
@@ -228,7 +309,8 @@ fn read_dir_u64_files(dir: &Path) -> HashMap<String, u64> {
         if let Ok(content) = std::fs::read_to_string(entry.path()) {
             // Try plain number first, then "since mount: N" format
             let val = content.trim().parse::<u64>().unwrap_or_else(|_| {
-                content.lines()
+                content
+                    .lines()
                     .find(|l| l.contains("since mount"))
                     .and_then(|l| l.split(':').next_back())
                     .and_then(|v| v.trim().parse().ok())
@@ -293,7 +375,8 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
     // Sort by (label, natural device name) so labeled groups stay together
     // and sd[a-z]+ devices order as sda < sdz < sdaa rather than lexically.
     devices.sort_by(|a, b| {
-        a.label.cmp(&b.label)
+        a.label
+            .cmp(&b.label)
             .then_with(|| natural_key(&a.name).cmp(&natural_key(&b.name)))
     });
     devices
@@ -437,21 +520,23 @@ fn read_background(sysfs: &Path, mount_point: &str) -> Vec<(String, String)> {
         }
 
         // Try multiple status file names (varies by kernel version)
-        let status_names = [
-            format!("{prefix}_status"),
-            "copy_gc_wait".to_string(),
-        ];
+        let status_names = [format!("{prefix}_status"), "copy_gc_wait".to_string()];
         let mut status = String::new();
         for name in &status_names {
             let path = dir.join(name);
             if let Ok(content) = std::fs::read_to_string(&path) {
-                let running = content.lines()
+                let running = content
+                    .lines()
                     .find(|l| l.trim().starts_with("running:"))
                     .and_then(|l| l.split(':').next_back())
                     .map(|v| v.trim() == "1")
                     .unwrap_or(false);
 
-                status = if running { "working".into() } else { "idle".into() };
+                status = if running {
+                    "working".into()
+                } else {
+                    "idle".into()
+                };
                 break;
             }
         }
@@ -490,7 +575,9 @@ fn read_diskstats_for(dev_name: &str) -> (u64, u64, u64) {
 fn read_cpu_iowait() -> (u64, u64) {
     let content = std::fs::read_to_string("/proc/stat").unwrap_or_default();
     if let Some(line) = content.lines().find(|l| l.starts_with("cpu ")) {
-        let fields: Vec<u64> = line.split_whitespace().skip(1)
+        let fields: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
             .filter_map(|v| v.parse().ok())
             .collect();
         // fields: user, nice, system, idle, iowait, irq, softirq, steal...
@@ -534,6 +621,27 @@ fn read_recent_mean_us(sysfs: &Path, stat_name: &str) -> f64 {
         }
     }
     0.0
+}
+
+fn read_time_stat_count(sysfs: &Path, stat_name: &str) -> u64 {
+    let json_path = sysfs.join("time_stats_json").join(stat_name);
+    if let Ok(content) = std::fs::read_to_string(json_path)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(count) = json["count"].as_u64()
+    {
+        return count;
+    }
+
+    let text_path = sysfs.join("time_stats").join(stat_name);
+    std::fs::read_to_string(text_path)
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("count:")
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 fn to_microseconds(val: f64, unit: &str) -> f64 {
@@ -605,7 +713,9 @@ fn read_blocked_stats(sysfs: &Path) -> Vec<(String, u64, f64)> {
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("count:") {
-                count = trimmed.split_whitespace().nth(1)
+                count = trimmed
+                    .split_whitespace()
+                    .nth(1)
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
             }
@@ -756,10 +866,12 @@ fn read_reconcile_status(mount_point: &str) -> String {
     };
 
     // Extract progress percentage if processing
-    let progress = output.lines()
+    let progress = output
+        .lines()
         .find(|l| l.contains('%'))
         .and_then(|l| {
-            l.split('%').next()
+            l.split('%')
+                .next()
                 .and_then(|s| s.split_whitespace().last())
                 .map(|s| format!(" {s}%"))
         })
@@ -772,7 +884,17 @@ fn read_reconcile_status(mount_point: &str) -> String {
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() >= 2 && parts[0].ends_with(':') {
             let name = parts[0].trim_end_matches(':');
-            if ["replicas", "checksum", "erasure_code", "compression", "target", "pending", "stripes"].contains(&name) {
+            if [
+                "replicas",
+                "checksum",
+                "erasure_code",
+                "compression",
+                "target",
+                "pending",
+                "stripes",
+            ]
+            .contains(&name)
+            {
                 let has_nonzero = parts[1..].iter().any(|v| *v != "0");
                 if has_nonzero {
                     pending_categories.push(format!("{name}:{}", parts[1]));
@@ -835,7 +957,12 @@ pub fn read_all_process_io() -> Vec<ProcessIo> {
             .unwrap_or_default()
             .trim()
             .to_string();
-        result.push(ProcessIo { pid, name: comm, read_bytes, write_bytes });
+        result.push(ProcessIo {
+            pid,
+            name: comm,
+            read_bytes,
+            write_bytes,
+        });
     }
     result
 }

@@ -93,5 +93,4 @@ impl TuningState {
         self.edit_buf.clear();
         Ok(value)
     }
-
 }
