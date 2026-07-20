@@ -74,17 +74,20 @@ pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
             .unwrap_or_default();
 
         let read_delta = curr_dev.io_done_read.saturating_sub(prev_dev.io_done_read);
-        let write_delta = curr_dev.io_done_write.saturating_sub(prev_dev.io_done_write);
+        let write_delta = curr_dev
+            .io_done_write
+            .saturating_sub(prev_dev.io_done_write);
 
-        let diff_map = |curr: &HashMap<String, u64>, prev: &HashMap<String, u64>| -> HashMap<String, f64> {
-            curr.iter()
-                .map(|(k, &v)| {
-                    let delta = v.saturating_sub(*prev.get(k).unwrap_or(&0));
-                    (k.clone(), delta as f64 / dt)
-                })
-                .filter(|(_, rate)| *rate > 0.0)
-                .collect()
-        };
+        let diff_map =
+            |curr: &HashMap<String, u64>, prev: &HashMap<String, u64>| -> HashMap<String, f64> {
+                curr.iter()
+                    .map(|(k, &v)| {
+                        let delta = v.saturating_sub(*prev.get(k).unwrap_or(&0));
+                        (k.clone(), delta as f64 / dt)
+                    })
+                    .filter(|(_, rate)| *rate > 0.0)
+                    .collect()
+            };
 
         devices.push(DeviceRate {
             name: curr_dev.name.clone(),
@@ -93,10 +96,19 @@ pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
             write_bytes_sec: write_delta as f64 / dt,
             read_active: read_delta > 0,
             write_active: write_delta > 0,
-            read_iops: curr_dev.diskstats_reads.saturating_sub(prev_dev.diskstats_reads) as f64 / dt,
-            write_iops: curr_dev.diskstats_writes.saturating_sub(prev_dev.diskstats_writes) as f64 / dt,
+            read_iops: curr_dev
+                .diskstats_reads
+                .saturating_sub(prev_dev.diskstats_reads) as f64
+                / dt,
+            write_iops: curr_dev
+                .diskstats_writes
+                .saturating_sub(prev_dev.diskstats_writes) as f64
+                / dt,
             util_pct: {
-                let io_ms_delta = curr_dev.diskstats_io_ms.saturating_sub(prev_dev.diskstats_io_ms) as f64;
+                let io_ms_delta = curr_dev
+                    .diskstats_io_ms
+                    .saturating_sub(prev_dev.diskstats_io_ms)
+                    as f64;
                 (io_ms_delta / (dt * 1000.0) * 100.0).min(100.0)
             },
             read_by_type: diff_map(&curr_dev.io_read_by_type, &prev_dev.io_read_by_type),
@@ -144,28 +156,34 @@ pub fn compute_process_rates(
         if let Some(p) = prev_map.get(&c.pid) {
             let rd = c.read_bytes.saturating_sub(p.read_bytes) as f64 / dt;
             let wd = c.write_bytes.saturating_sub(p.write_bytes) as f64 / dt;
-            by_pid.insert(c.pid, ProcessRate {
-                pid: c.pid,
-                name: c.name.clone(),
-                read_bytes_sec: rd,
-                write_bytes_sec: wd,
-                total_read: c.read_bytes,
-                total_write: c.write_bytes,
-            });
+            by_pid.insert(
+                c.pid,
+                ProcessRate {
+                    pid: c.pid,
+                    name: c.name.clone(),
+                    read_bytes_sec: rd,
+                    write_bytes_sec: wd,
+                    total_read: c.read_bytes,
+                    total_write: c.write_bytes,
+                },
+            );
         }
     }
 
     // Carry forward previously-seen processes that still exist (with zero rates if idle)
     for prev_rate in previous_rates {
         if curr_pids.contains(&prev_rate.pid) && !by_pid.contains_key(&prev_rate.pid) {
-            by_pid.insert(prev_rate.pid, ProcessRate {
-                pid: prev_rate.pid,
-                name: prev_rate.name.clone(),
-                read_bytes_sec: 0.0,
-                write_bytes_sec: 0.0,
-                total_read: prev_rate.total_read,
-                total_write: prev_rate.total_write,
-            });
+            by_pid.insert(
+                prev_rate.pid,
+                ProcessRate {
+                    pid: prev_rate.pid,
+                    name: prev_rate.name.clone(),
+                    read_bytes_sec: 0.0,
+                    write_bytes_sec: 0.0,
+                    total_read: prev_rate.total_read,
+                    total_write: prev_rate.total_write,
+                },
+            );
         }
     }
 

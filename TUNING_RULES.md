@@ -1,6 +1,6 @@
 # nasty-top Tuning Hints
 
-These rules are evaluated on every tick (2s), in priority order. The first matching rule produces an informational hint shown in the footer bar with an example sysfs command. **Hints are not applied automatically** — the user decides whether to run the command. Press `N` to mute the current hint for 2 minutes or `!` to suppress it permanently.
+These rules are evaluated on every configured refresh interval, in priority order. The first matching rule produces an informational hint shown in the footer bar with an example sysfs command. **Hints are not applied automatically** — the user decides whether to run the command. Press `N` to mute the current hint for 2 minutes or `!` to suppress it permanently.
 
 The heuristics are best-effort and unverified upstream; treat them as pointers to *something is happening*, not authoritative tuning advice.
 
@@ -25,7 +25,7 @@ Stalls are detected from bcachefs `time_stats` "recent" (EWMA) mean, only when t
 
 - `data_read` recent mean > **200ms** with active reads → read stall
 - `data_write` recent mean > **200ms** with active writes → write stall
-- `btree_node_read` recent mean > **50ms** → metadata stall
+- `btree_node_read` recent mean > **50ms** with new btree reads → metadata stall
 - Journal dirty entries jump by >1000 in one tick AND fill >70% → journal pressure
 
 Stall events expire after **60 seconds**. Up to 10 are tracked, last 5 shown in the Background section.

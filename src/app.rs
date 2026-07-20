@@ -41,6 +41,8 @@ pub struct App {
     pub focus: Focus,
     pub last_tick: Instant,
     pub status_msg: Option<String>,
+    pub status_msg_since: Option<Instant>,
+    pub status_msg_rendered: bool,
     pub should_quit: bool,
     /// All discovered bcachefs filesystems.
     pub all_fs: Vec<sysfs::BcachefsFs>,
@@ -67,6 +69,8 @@ pub struct App {
     pub blocked_deltas: Vec<(String, u64, f64)>,
     /// Counter deltas per tick: (name, delta, cumulative).
     pub counter_deltas: Vec<(String, u64, u64)>,
+    /// Actual seconds between the snapshots used for the current deltas.
+    pub sample_interval: f64,
     /// Time stats with delta count per tick.
     pub time_stats_view: Vec<TimeStatView>,
     /// CPU iowait % (computed from delta between ticks).
@@ -86,7 +90,9 @@ impl App {
         let fs = all_fs[fs_index].clone();
         let snap = sysfs::snapshot(&fs);
         let tuning = TuningState::new(&snap.options);
-        let initial_errors = snap.devices.iter()
+        let initial_errors = snap
+            .devices
+            .iter()
             .map(|d| (d.name.clone(), d.io_errors))
             .collect();
         Self {
@@ -99,6 +105,8 @@ impl App {
             focus: Focus::Metrics,
             last_tick: Instant::now(),
             status_msg: None,
+            status_msg_since: None,
+            status_msg_rendered: false,
             should_quit: false,
             all_fs,
             fs_index,
@@ -112,6 +120,7 @@ impl App {
             proposal_first_shown: None,
             blocked_deltas: Vec::new(),
             counter_deltas: Vec::new(),
+            sample_interval: 0.0,
             time_stats_view: Vec::new(),
             iowait_pct: 0.0,
             show_counters: false,
@@ -128,13 +137,16 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64();
         self.last_tick = now;
+        self.sample_interval = dt;
 
         let new_snap = sysfs::snapshot(&self.fs);
 
         // Baseline error counts for any newly-appearing devices so we
         // don't flag pre-existing errors on a device added mid-session.
         for d in &new_snap.devices {
-            self.initial_errors.entry(d.name.clone()).or_insert(d.io_errors);
+            self.initial_errors
+                .entry(d.name.clone())
+                .or_insert(d.io_errors);
         }
 
         // Compute rates from previous snapshot
@@ -149,7 +161,11 @@ impl App {
         // CPU iowait %
         let iowait_delta = new_snap.cpu_iowait.saturating_sub(self.current.cpu_iowait) as f64;
         let cpu_total_delta = new_snap.cpu_total.saturating_sub(self.current.cpu_total) as f64;
-        self.iowait_pct = if cpu_total_delta > 0.0 { iowait_delta / cpu_total_delta * 100.0 } else { 0.0 };
+        self.iowait_pct = if cpu_total_delta > 0.0 {
+            iowait_delta / cpu_total_delta * 100.0
+        } else {
+            0.0
+        };
 
         // IOPS totals for sparkline titles
         let total_read_iops: f64 = rates.devices.iter().map(|d| d.read_iops).sum();
@@ -161,8 +177,22 @@ impl App {
         // there's actual IO — the EWMA doesn't decay when idle.
         let has_reads = rates.devices.iter().any(|d| d.read_active);
         let has_writes = rates.devices.iter().any(|d| d.write_active);
-        self.history.push("avg_read_latency_us", if has_reads { new_snap.recent_data_read_us } else { 0.0 });
-        self.history.push("avg_write_latency_us", if has_writes { new_snap.recent_data_write_us } else { 0.0 });
+        self.history.push(
+            "avg_read_latency_us",
+            if has_reads {
+                new_snap.recent_data_read_us
+            } else {
+                0.0
+            },
+        );
+        self.history.push(
+            "avg_write_latency_us",
+            if has_writes {
+                new_snap.recent_data_write_us
+            } else {
+                0.0
+            },
+        );
 
         // Refresh tuning option names if they changed (shouldn't normally)
         self.tuning.refresh_names(&new_snap.options);
@@ -171,61 +201,95 @@ impl App {
         if self.previous.is_some() {
             // Data read latency spike (>200ms recent mean, only when reads active)
             if has_reads && new_snap.recent_data_read_us > 200_000.0 {
-                self.stall_events.insert(0, StallEvent {
-                    time: now,
-                    device: "fs".into(),
-                    direction: "read",
-                    detail: format!("data_read recent mean {}", format_duration_us(new_snap.recent_data_read_us)),
-                });
+                self.stall_events.insert(
+                    0,
+                    StallEvent {
+                        time: now,
+                        device: "fs".into(),
+                        direction: "read",
+                        detail: format!(
+                            "data_read recent mean {}",
+                            format_duration_us(new_snap.recent_data_read_us)
+                        ),
+                    },
+                );
             }
 
             // Data write latency spike (>200ms recent mean, only when writes active)
             if has_writes && new_snap.recent_data_write_us > 200_000.0 {
-                self.stall_events.insert(0, StallEvent {
-                    time: now,
-                    device: "fs".into(),
-                    direction: "write",
-                    detail: format!("data_write recent mean {}", format_duration_us(new_snap.recent_data_write_us)),
-                });
+                self.stall_events.insert(
+                    0,
+                    StallEvent {
+                        time: now,
+                        device: "fs".into(),
+                        direction: "write",
+                        detail: format!(
+                            "data_write recent mean {}",
+                            format_duration_us(new_snap.recent_data_write_us)
+                        ),
+                    },
+                );
             }
 
-            // Btree read latency spike (>50ms is bad for metadata)
-            if new_snap.recent_btree_read_us > 50_000.0 {
-                self.stall_events.insert(0, StallEvent {
-                    time: now,
-                    device: "fs".into(),
-                    direction: "read",
-                    detail: format!("btree_read recent mean {}", format_duration_us(new_snap.recent_btree_read_us)),
-                });
+            // The recent mean is an EWMA and stays high while idle. Only emit
+            // a new event when btree reads actually occurred this tick.
+            if btree_read_stalled(&self.current, &new_snap) {
+                self.stall_events.insert(
+                    0,
+                    StallEvent {
+                        time: now,
+                        device: "fs".into(),
+                        direction: "read",
+                        detail: format!(
+                            "btree_read recent mean {}",
+                            format_duration_us(new_snap.recent_btree_read_us)
+                        ),
+                    },
+                );
             }
 
             // Journal pressure: fill rate increasing rapidly
             let (prev_dirty, _) = self.current.journal_fill; // current is still old here
             let (curr_dirty, curr_total) = new_snap.journal_fill;
-            let curr_pct = if curr_total > 0 { curr_dirty as f64 / curr_total as f64 * 100.0 } else { 0.0 };
+            let curr_pct = if curr_total > 0 {
+                curr_dirty as f64 / curr_total as f64 * 100.0
+            } else {
+                0.0
+            };
             if curr_dirty > prev_dirty + 1000 && curr_pct > 70.0 {
-                self.stall_events.insert(0, StallEvent {
-                    time: now,
-                    device: "journal".into(),
-                    direction: "write",
-                    detail: format!("filling rapidly: {:.0}%", curr_pct),
-                });
+                self.stall_events.insert(
+                    0,
+                    StallEvent {
+                        time: now,
+                        device: "journal".into(),
+                        direction: "write",
+                        detail: format!("filling rapidly: {:.0}%", curr_pct),
+                    },
+                );
             }
 
             self.stall_events.truncate(10);
         }
         // Expire stalls older than 60s
-        self.stall_events.retain(|e| e.time.elapsed().as_secs() < 60);
+        self.stall_events
+            .retain(|e| e.time.elapsed().as_secs() < 60);
 
         // Compute blocked stat deltas (before new_snap moves)
-        self.blocked_deltas = new_snap.blocked_stats.iter().map(|(name, count, recent_us)| {
-            let prev_count = self.current.blocked_stats.iter()
-                .find(|(n, _, _)| n == name)
-                .map(|(_, c, _)| *c)
-                .unwrap_or(*count);
-            let delta = count.saturating_sub(prev_count);
-            (name.clone(), delta, *recent_us)
-        }).collect();
+        self.blocked_deltas = new_snap
+            .blocked_stats
+            .iter()
+            .map(|(name, count, recent_us)| {
+                let prev_count = self
+                    .current
+                    .blocked_stats
+                    .iter()
+                    .find(|(n, _, _)| n == name)
+                    .map(|(_, c, _)| *c)
+                    .unwrap_or(*count);
+                let delta = count.saturating_sub(prev_count);
+                (name.clone(), delta, *recent_us)
+            })
+            .collect();
         self.blocked_deltas.sort_by(|a, b| {
             let a_active = a.1 > 0;
             let b_active = b.1 > 0;
@@ -237,22 +301,29 @@ impl App {
         });
 
         // Compute time_stats view with deltas
-        self.time_stats_view = new_snap.all_time_stats.iter().map(|ts| {
-            let prev_count = self.current.all_time_stats.iter()
-                .find(|p| p.name == ts.name)
-                .map(|p| p.count)
-                .unwrap_or(ts.count);
-            let delta = ts.count.saturating_sub(prev_count);
-            TimeStatView {
-                name: ts.name.clone(),
-                count_delta: delta,
-                count_total: ts.count,
-                mean_ns: ts.dur_mean_ns,
-                recent_ns: ts.dur_recent_ns,
-                max_ns: ts.dur_max_ns,
-                is_blocked: ts.name.starts_with("blocked_"),
-            }
-        }).collect();
+        self.time_stats_view = new_snap
+            .all_time_stats
+            .iter()
+            .map(|ts| {
+                let prev_count = self
+                    .current
+                    .all_time_stats
+                    .iter()
+                    .find(|p| p.name == ts.name)
+                    .map(|p| p.count)
+                    .unwrap_or(ts.count);
+                let delta = ts.count.saturating_sub(prev_count);
+                TimeStatView {
+                    name: ts.name.clone(),
+                    count_delta: delta,
+                    count_total: ts.count,
+                    mean_ns: ts.dur_mean_ns,
+                    recent_ns: ts.dur_recent_ns,
+                    max_ns: ts.dur_max_ns,
+                    is_blocked: ts.name.starts_with("blocked_"),
+                }
+            })
+            .collect();
         // Sort: active first by delta desc, blocked first within active, then alphabetical
         self.time_stats_view.sort_by(|a, b| {
             match (a.count_delta > 0, b.count_delta > 0) {
@@ -271,20 +342,23 @@ impl App {
         });
 
         // Compute counter deltas
-        self.counter_deltas = new_snap.counters.iter().map(|(name, &val)| {
-            let prev_val = self.current.counters.get(name).copied().unwrap_or(val);
-            let delta = val.saturating_sub(prev_val);
-            (name.clone(), delta, val)
-        }).collect();
+        self.counter_deltas = new_snap
+            .counters
+            .iter()
+            .map(|(name, &val)| {
+                let prev_val = self.current.counters.get(name).copied().unwrap_or(val);
+                let delta = val.saturating_sub(prev_val);
+                (name.clone(), delta, val)
+            })
+            .collect();
         // Sort: active first by delta desc, then alphabetical
-        self.counter_deltas.sort_by(|a, b| {
-            match (a.1 > 0, b.1 > 0) {
+        self.counter_deltas
+            .sort_by(|a, b| match (a.1 > 0, b.1 > 0) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
                 _ if a.1 != b.1 => b.1.cmp(&a.1),
                 _ => a.0.cmp(&b.0),
-            }
-        });
+            });
 
         self.previous = Some(std::mem::replace(&mut self.current, new_snap));
         self.rates = Some(rates);
@@ -303,7 +377,8 @@ impl App {
                 self.proposal_first_shown = Some(now);
             }
             (Some(_), None) => {
-                let elapsed = self.proposal_first_shown
+                let elapsed = self
+                    .proposal_first_shown
                     .map(|t| t.elapsed())
                     .unwrap_or(MIN_HINT_DISPLAY);
                 if elapsed >= MIN_HINT_DISPLAY {
@@ -318,24 +393,45 @@ impl App {
         if self.show_processes {
             let curr_proc = sysfs::read_all_process_io();
             self.process_rates = metrics::compute_process_rates(
-                &self.prev_proc_io, &curr_proc, dt, 20, &self.process_rates,
+                &self.prev_proc_io,
+                &curr_proc,
+                dt,
+                20,
+                &self.process_rates,
             );
             self.prev_proc_io = curr_proc;
         }
 
-        // Clear status message after a few ticks
-        if self.status_msg.is_some() {
-            self.status_msg = None;
+        if self.status_msg_since.is_some_and(|shown| {
+            self.status_msg_rendered && shown.elapsed() >= std::time::Duration::from_secs(4)
+        }) {
+            self.clear_status();
         }
     }
 
     pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Metrics => Focus::Tuning,
-            Focus::Tuning => Focus::Metrics,
-        };
+        self.focus = toggled_focus(self.show_options, self.focus);
     }
 
+    pub fn toggle_options(&mut self) {
+        self.show_options = !self.show_options;
+        if !self.show_options {
+            self.focus = Focus::Metrics;
+            self.tuning.cancel_edit();
+        }
+    }
+
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status_msg = Some(message.into());
+        self.status_msg_since = Some(Instant::now());
+        self.status_msg_rendered = false;
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status_msg = None;
+        self.status_msg_since = None;
+        self.status_msg_rendered = false;
+    }
 }
 
 fn format_duration_us(us: f64) -> String {
@@ -349,54 +445,76 @@ fn format_duration_us(us: f64) -> String {
 }
 
 impl App {
-    pub fn switch_fs(&mut self) {
+    pub fn switch_fs(&mut self) -> bool {
         if self.all_fs.len() <= 1 {
-            self.status_msg = Some("Only one filesystem mounted".into());
-            return;
+            self.set_status("Only one filesystem mounted");
+            return false;
         }
         self.fs_index = (self.fs_index + 1) % self.all_fs.len();
         self.fs = self.all_fs[self.fs_index].clone();
         let snap = sysfs::snapshot(&self.fs);
         self.tuning = TuningState::new(&snap.options);
-        self.initial_errors = snap.devices.iter()
+        self.initial_errors = snap
+            .devices
+            .iter()
             .map(|d| (d.name.clone(), d.io_errors))
             .collect();
         self.current = snap;
         self.previous = None;
         self.rates = None;
+        self.last_tick = Instant::now();
         self.history = History::new(120);
         self.stall_events.clear();
         self.blocked_deltas.clear();
+        self.counter_deltas.clear();
+        self.time_stats_view.clear();
+        self.sample_interval = 0.0;
+        self.process_rates.clear();
+        self.prev_proc_io = sysfs::read_all_process_io();
+        self.iowait_pct = 0.0;
+        self.view_scroll = 0;
         self.proposal = None;
         self.proposal_first_shown = None;
-        self.status_msg = Some(format!("Switched to: {} ({}/{})",
-            self.fs.fs_name, self.fs_index + 1, self.all_fs.len()));
+        self.set_status(format!(
+            "Switched to: {} ({}/{})",
+            self.fs.fs_name,
+            self.fs_index + 1,
+            self.all_fs.len()
+        ));
+        true
     }
 
     pub fn toggle_option(&mut self, name: &str) {
-        let current = self.current.options.get(name)
+        let current = self
+            .current
+            .options
+            .get(name)
             .map(|v| v.trim() == "1")
             .unwrap_or(false);
         let new_val = if current { "0" } else { "1" };
         match sysfs::write_option(&self.fs, name, new_val) {
-            Ok(()) => self.status_msg = Some(format!("{name} = {new_val}")),
-            Err(e) => self.status_msg = Some(format!("Failed: {e}")),
+            Ok(()) => self.set_status(format!("{name} = {new_val}")),
+            Err(e) => self.set_status(format!("Failed: {e}")),
         }
     }
 
     pub fn dismiss_proposal(&mut self) {
         if let Some(ref p) = self.proposal {
-            self.dismissed_temp.push((p.option.clone(), std::time::Instant::now()));
+            self.dismissed_temp
+                .push((p.option.clone(), std::time::Instant::now()));
         }
         self.proposal = None;
         self.proposal_first_shown = None;
-        self.status_msg = Some("Muted for 2 minutes".into());
+        self.set_status("Muted for 2 minutes");
     }
 
     pub fn dismiss_permanent(&mut self) {
         if let Some(ref p) = self.proposal {
             self.dismissed_permanent.insert(p.option.clone());
-            self.status_msg = Some(format!("Won't hint about {} again (press C to clear)", p.option));
+            self.set_status(format!(
+                "Won't hint about {} again (press C to clear)",
+                p.option
+            ));
         }
         self.proposal = None;
         self.proposal_first_shown = None;
@@ -406,30 +524,30 @@ impl App {
         let count = self.dismissed_permanent.len();
         self.dismissed_permanent.clear();
         self.dismissed_temp.clear();
-        self.status_msg = Some(format!("Cleared {} permanent dismissals", count));
+        self.set_status(format!("Cleared {} permanent dismissals", count));
     }
 
     pub fn is_dismissed(&self, option: &str) -> bool {
         if self.dismissed_permanent.contains(option) {
             return true;
         }
-        self.dismissed_temp.iter().any(|(name, when)| {
-            name == option && when.elapsed().as_secs() < 120
-        })
+        self.dismissed_temp
+            .iter()
+            .any(|(name, when)| name == option && when.elapsed().as_secs() < 120)
     }
 
     pub fn handle_enter(&mut self) {
-        if !matches!(self.focus, Focus::Tuning) {
+        if !self.show_options || !matches!(self.focus, Focus::Tuning) {
             return;
         }
         if self.tuning.editing {
             match self.tuning.commit_edit(&self.fs) {
                 Ok(val) => {
                     let name = self.tuning.selected_name().unwrap_or("?").to_string();
-                    self.status_msg = Some(format!("Set {name} = {val}"));
+                    self.set_status(format!("Set {name} = {val}"));
                 }
                 Err(e) => {
-                    self.status_msg = Some(format!("Error: {e}"));
+                    self.set_status(format!("Error: {e}"));
                 }
             }
         } else if let Some(name) = self.tuning.selected_name() {
@@ -441,5 +559,52 @@ impl App {
                 .unwrap_or("");
             self.tuning.start_edit(current);
         }
+    }
+}
+
+fn toggled_focus(show_options: bool, focus: Focus) -> Focus {
+    if !show_options {
+        return Focus::Metrics;
+    }
+    match focus {
+        Focus::Metrics => Focus::Tuning,
+        Focus::Tuning => Focus::Metrics,
+    }
+}
+
+fn btree_read_stalled(previous: &FsSnapshot, current: &FsSnapshot) -> bool {
+    current.btree_read_count > previous.btree_read_count && current.recent_btree_read_us > 50_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot_with_btree_reads(count: u64, recent_us: f64) -> FsSnapshot {
+        FsSnapshot {
+            btree_read_count: count,
+            recent_btree_read_us: recent_us,
+            ..FsSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn hidden_options_panel_cannot_receive_focus() {
+        assert_eq!(toggled_focus(false, Focus::Metrics), Focus::Metrics);
+        assert_eq!(toggled_focus(false, Focus::Tuning), Focus::Metrics);
+        assert_eq!(toggled_focus(true, Focus::Metrics), Focus::Tuning);
+        assert_eq!(toggled_focus(true, Focus::Tuning), Focus::Metrics);
+    }
+
+    #[test]
+    fn btree_stall_requires_new_reads_and_high_latency() {
+        let previous = snapshot_with_btree_reads(10, 0.0);
+        let stale_latency = snapshot_with_btree_reads(10, 75_000.0);
+        let low_latency = snapshot_with_btree_reads(11, 50_000.0);
+        let stalled = snapshot_with_btree_reads(11, 50_001.0);
+
+        assert!(!btree_read_stalled(&previous, &stale_latency));
+        assert!(!btree_read_stalled(&previous, &low_latency));
+        assert!(btree_read_stalled(&previous, &stalled));
     }
 }
