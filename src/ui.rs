@@ -317,12 +317,19 @@ fn draw_system_panel(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
     } else {
         0.0
     };
+    let memory_used = app
+        .current
+        .memory_total_bytes
+        .saturating_sub(app.current.memory_available_bytes);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // load avg
             Constraint::Length(1), // uptime
+            Constraint::Length(1), // host memory
+            Constraint::Length(1), // available/reclaimable memory
+            Constraint::Length(1), // btree cache
             Constraint::Length(1), // spacer
             Constraint::Length(1), // iowait gauge
             Constraint::Length(1), // journal gauge
@@ -348,9 +355,57 @@ fn draw_system_panel(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
     ]);
     f.render_widget(Paragraph::new(up_line), rows[1]);
 
-    render_gauge(f, rows[3], " IOw", app.iowait_pct, theme::dim());
-    render_gauge(f, rows[4], " Jnl", jpct, theme::dim());
-    render_gauge(f, rows[5], " Dsk", space_pct, theme::dim());
+    let memory_line = Line::from(vec![
+        Span::styled(" RAM ", theme::dim()),
+        Span::styled(
+            format!(
+                "{}/{}",
+                format_bytes_short(memory_used as f64),
+                format_bytes_short(app.current.memory_total_bytes as f64)
+            ),
+            Style::default().fg(theme::FG),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(memory_line), rows[2]);
+
+    let available_line = Line::from(vec![
+        Span::styled(" Avl ", theme::dim()),
+        Span::styled(
+            format_bytes_short(app.current.memory_available_bytes as f64),
+            Style::default().fg(theme::FG),
+        ),
+        Span::styled(
+            format!(
+                "  Kr {}",
+                format_bytes_short(app.current.kernel_reclaimable_bytes as f64)
+            ),
+            theme::dim(),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(available_line), rows[3]);
+
+    let cache_line = if let Some(bytes) = app.current.btree_cache_size_bytes {
+        let ram_pct = if app.current.memory_total_bytes > 0 {
+            bytes as f64 / app.current.memory_total_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
+        Line::from(vec![
+            Span::styled(" Btr ", theme::dim()),
+            Span::styled(format_bytes(bytes as f64), Style::default().fg(theme::FG)),
+            Span::styled(format!("  {ram_pct:.1}%"), theme::dim()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" Btr ", theme::dim()),
+            Span::styled("not exposed by kernel", theme::dim()),
+        ])
+    };
+    f.render_widget(Paragraph::new(cache_line), rows[4]);
+
+    render_gauge(f, rows[6], " IOw", app.iowait_pct, theme::dim());
+    render_gauge(f, rows[7], " Jnl", jpct, theme::dim());
+    render_gauge(f, rows[8], " Dsk", space_pct, theme::dim());
 }
 
 #[allow(clippy::too_many_arguments)]
