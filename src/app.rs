@@ -79,6 +79,10 @@ pub struct App {
     pub show_help: bool,
     /// Scroll offset for counter/time stats/process views.
     pub view_scroll: usize,
+    /// Selected row in the synchronized device tables.
+    pub device_scroll: usize,
+    /// Show the most pressured devices first instead of sysfs order.
+    pub sort_devices_by_pressure: bool,
     /// Per-device io_errors value when first observed in this session.
     /// Used to color the Err cell: matching baseline = historic (dim),
     /// growing = active (red).
@@ -126,6 +130,8 @@ impl App {
             show_counters: false,
             show_help: false,
             view_scroll: 0,
+            device_scroll: 0,
+            sort_devices_by_pressure: false,
             dismissed_temp: Vec::new(),
             dismissed_permanent: std::collections::HashSet::new(),
             initial_errors,
@@ -362,6 +368,12 @@ impl App {
 
         self.previous = Some(std::mem::replace(&mut self.current, new_snap));
         self.rates = Some(rates);
+        self.device_scroll = self.device_scroll.min(
+            self.rates
+                .as_ref()
+                .map(|rates| rates.devices.len().saturating_sub(1))
+                .unwrap_or(0),
+        );
 
         // Run advisor. Hints persist for at least MIN_HINT_DISPLAY even if
         // the trigger condition stops firing, so single-tick triggers don't
@@ -432,6 +444,29 @@ impl App {
         self.status_msg_since = None;
         self.status_msg_rendered = false;
     }
+
+    pub fn scroll_devices_up(&mut self) {
+        self.device_scroll = self.device_scroll.saturating_sub(1);
+    }
+
+    pub fn scroll_devices_down(&mut self) {
+        let last = self
+            .rates
+            .as_ref()
+            .map(|rates| rates.devices.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.device_scroll = (self.device_scroll + 1).min(last);
+    }
+
+    pub fn toggle_device_sort(&mut self) {
+        self.sort_devices_by_pressure = !self.sort_devices_by_pressure;
+        self.device_scroll = 0;
+        self.set_status(if self.sort_devices_by_pressure {
+            "Devices sorted by pressure"
+        } else {
+            "Devices sorted by filesystem order"
+        });
+    }
 }
 
 fn format_duration_us(us: f64) -> String {
@@ -473,6 +508,7 @@ impl App {
         self.prev_proc_io = sysfs::read_all_process_io();
         self.iowait_pct = 0.0;
         self.view_scroll = 0;
+        self.device_scroll = 0;
         self.proposal = None;
         self.proposal_first_shown = None;
         self.set_status(format!(
