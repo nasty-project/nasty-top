@@ -20,6 +20,7 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Multi-filesystem support** — press `f` to cycle between mounted bcachefs filesystems
 - **Process IO view** showing which processes are doing IO
 - **Journal fill %**, load average, reconcile progress
+- **Memory pressure context** with host RAM, available RAM, kernel-reclaimable memory, and the selected filesystem's btree-node cache
 - **Session-aware error counts**: the device Err column dims pre-existing counts and turns bold red only when errors grow during the current run — so you can tell at a glance whether a number is dead history or actively climbing
 - **Consistent color scheme**: yellow = read, blue = write, red = errors/stalls
 
@@ -91,6 +92,8 @@ Options:
 | IO latency (fs) | `time_stats/data_{read,write}` | "recent" column rolling mean |
 | Blocked stats | `time_stats/blocked_*` | Count delta per tick + recent mean |
 | Journal fill | `internal/journal_debug` | dirty/total entries + watermark |
+| Btree-node cache | `btree_cache_size` | Kernel-reported main buffers; approximate and not total bcachefs RAM |
+| Host memory | `/proc/meminfo` | Used, available, and kernel-reclaimable memory |
 | Reconcile | `bcachefs reconcile status` | Subprocess, parsed for progress |
 | Process IO | `/proc/<pid>/io` | read_bytes/write_bytes diffed |
 | Options | `options/*` | Read/write directly to sysfs |
