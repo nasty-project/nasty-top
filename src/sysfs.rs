@@ -263,6 +263,24 @@ mod tests {
             Some("/fs/original")
         );
     }
+
+    #[test]
+    fn parses_btree_cache_human_bytes() {
+        assert_eq!(parse_human_bytes("4096"), Some(4096));
+        assert_eq!(parse_human_bytes("256k"), Some(256 * 1024));
+        assert_eq!(parse_human_bytes("1.5M"), Some(1_572_864));
+        assert_eq!(parse_human_bytes("unknown"), None);
+    }
+
+    #[test]
+    fn parses_host_memory_values_as_bytes() {
+        let meminfo =
+            "MemTotal:       32768 kB\nMemAvailable:   12288 kB\nKReclaimable:    2048 kB\n";
+        assert_eq!(
+            parse_memory_info(meminfo),
+            (32 * 1024 * 1024, 12 * 1024 * 1024, 2 * 1024 * 1024)
+        );
+    }
 }
 
 /// Read the block device name (e.g. "nvme0n1p1") from a bcachefs sysfs dev-N directory.
@@ -277,8 +295,7 @@ fn read_dev_name(dev_dir: &Path) -> Option<String> {
 pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
     let (iowait, cpu_total) = read_cpu_iowait();
     let (journal_fill, journal_watermark) = read_journal_fill(&fs.sysfs);
-    let (memory_total_bytes, memory_available_bytes, kernel_reclaimable_bytes) =
-        read_memory_info();
+    let (memory_total_bytes, memory_available_bytes, kernel_reclaimable_bytes) = read_memory_info();
 
     let (space_total, space_used) = read_fs_space(&fs.mount_point);
 
@@ -1031,26 +1048,4 @@ pub fn read_all_process_io() -> Vec<ProcessIo> {
 pub fn write_option(fs: &BcachefsFs, option: &str, value: &str) -> Result<(), String> {
     let path = fs.sysfs.join("options").join(option);
     std::fs::write(&path, value).map_err(|e| format!("Failed to write {option}: {e}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{parse_human_bytes, parse_memory_info};
-
-    #[test]
-    fn parses_btree_cache_human_bytes() {
-        assert_eq!(parse_human_bytes("4096"), Some(4096));
-        assert_eq!(parse_human_bytes("256k"), Some(256 * 1024));
-        assert_eq!(parse_human_bytes("1.5M"), Some(1_572_864));
-        assert_eq!(parse_human_bytes("unknown"), None);
-    }
-
-    #[test]
-    fn parses_host_memory_values_as_bytes() {
-        let meminfo = "MemTotal:       32768 kB\nMemAvailable:   12288 kB\nKReclaimable:    2048 kB\n";
-        assert_eq!(
-            parse_memory_info(meminfo),
-            (32 * 1024 * 1024, 12 * 1024 * 1024, 2 * 1024 * 1024)
-        );
-    }
 }
