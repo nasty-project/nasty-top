@@ -217,12 +217,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char('o') => app.toggle_options(),
+        KeyCode::Char('s') => app.toggle_device_sort(),
         KeyCode::Tab => app.toggle_focus(),
         KeyCode::Up | KeyCode::Char('k') => {
             if matches!(app.focus, app::Focus::Tuning) {
                 app.tuning.scroll_up();
             } else if app.show_counters || app.show_blocked || app.show_processes {
                 app.view_scroll = app.view_scroll.saturating_sub(1);
+            } else {
+                app.scroll_devices_up();
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -230,6 +233,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.tuning.scroll_down();
             } else if app.show_counters || app.show_blocked || app.show_processes {
                 app.view_scroll += 1;
+            } else {
+                app.scroll_devices_down();
             }
         }
         KeyCode::Enter => app.handle_enter(),

@@ -13,6 +13,8 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Live IO throughput and latency** per device with user/btree/journal/sb breakdown
 - **Latency from bcachefs time_stats** (EWMA rolling mean, not useless cumulative averages)
 - **Per-device IO breakdown** using `io_done` JSON and `io_latency_stats_*_json`
+- **Per-device queue diagnostics** with current/average queue depth, IOPS, block await, utilization, and pressure outlier highlighting
+- **Large-pool navigation** with synchronized device-table scrolling and worst-pressure-first sorting
 - **Blocked stats view** showing what's actually blocking IO right now (allocator, journal, write buffer, etc.)
 - **Stall detection** with 60-second event log when latency exceeds 200ms
 - **Tuning hints** that flag known bcachefs pressure signals and show an example sysfs command (informational only — not applied automatically)
@@ -71,11 +73,12 @@ Options:
 | `c` | Toggle counters view |
 | `t` | Toggle blocked stats / time_stats view |
 | `p` | Toggle process IO view |
+| `s` | Toggle pressure / filesystem device ordering |
 | `r` | Toggle reconcile on/off |
 | `g` | Toggle copygc on/off |
 | `f` | Cycle between filesystems |
 | `Tab` | Switch focus between metrics and options panel |
-| `↑`/`k`, `↓`/`j` | Navigate options / scroll counter, blocked, process views |
+| `↑`/`k`, `↓`/`j` | Scroll devices or the active detail view |
 | `Enter` | Edit selected option value (in options panel) |
 | `Esc` | Cancel edit / dismiss status message |
 | `N` | Mute current hint for 2 minutes |
@@ -89,6 +92,7 @@ Options:
 |--------|--------|-------|
 | IO throughput | `dev-N/io_done` (JSON) | Per-type breakdown, diffed per tick |
 | IO latency (device) | `dev-N/io_latency_stats_{r,w}_json` | EWMA mean, shown only when active |
+| Queue depth / await / IOPS / utilization | `/proc/diskstats` | Instantaneous queue plus interval-derived rates |
 | IO latency (fs) | `time_stats/data_{read,write}` | "recent" column rolling mean |
 | Blocked stats | `time_stats/blocked_*` | Count delta per tick + recent mean |
 | Journal fill | `internal/journal_debug` | dirty/total entries + watermark |

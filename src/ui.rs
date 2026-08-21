@@ -1,6 +1,7 @@
 //! TUI rendering with ratatui — btop-inspired visual style.
 
 use crate::app::{App, Focus};
+use crate::metrics;
 use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -207,18 +208,13 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|r| r.devices.iter().any(|d| d.label.is_some()))
         .unwrap_or(false);
-    let left_col_width: u16 = if has_labels { 25 } else { 20 };
-
-    let dev_count = if app.show_counters {
-        app.counter_deltas.len().clamp(10, 30)
-    } else if app.show_blocked {
-        app.time_stats_view.len().clamp(10, 30)
-    } else if app.show_processes {
-        20
-    } else {
-        app.rates.as_ref().map(|r| r.devices.len()).unwrap_or(0)
+    let detailed_device_io = area.width >= 150;
+    let left_col_width: u16 = match (has_labels, detailed_device_io) {
+        (true, true) => 40,
+        (true, false) => 34,
+        (false, true) => 34,
+        (false, false) => 28,
     };
-    let dev_height = (dev_count + 4) as u16;
 
     // Dynamic background height: compact when no stalls
     let bg_count = app.current.background.len() as u16;
@@ -232,7 +228,7 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(12),        // sparklines
-            Constraint::Min(dev_height),   // device table (gets extra space)
+            Constraint::Min(8),            // device table (scrolls for large pools)
             Constraint::Length(bg_height), // background (dynamic)
         ])
         .split(area);
@@ -283,7 +279,15 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     } else if app.show_processes {
         draw_process_table(f, app, chunks[1], focus_style);
     } else {
-        draw_device_table(f, app, chunks[1], focus_style, has_labels, left_col_width);
+        draw_device_table(
+            f,
+            app,
+            chunks[1],
+            focus_style,
+            has_labels,
+            left_col_width,
+            detailed_device_io,
+        );
     }
 
     // ── Background + Stalls ──
@@ -521,6 +525,7 @@ fn draw_device_table(
     focus_style: Style,
     has_labels: bool,
     left_col_width: u16,
+    detailed_io: bool,
 ) {
     let bv = |v: f64| -> String {
         if v > 0.0 {
@@ -543,6 +548,12 @@ fn draw_device_table(
     let mut sw = [0.0_f64; 5];
     let mut sum_errs = 0u64;
     let mut sum_new_errs = 0u64;
+    let mut sum_queue = 0u64;
+    let mut sum_avg_queue = 0.0_f64;
+    let mut sum_read_iops = 0.0_f64;
+    let mut sum_write_iops = 0.0_f64;
+    let mut sum_read_wait = 0.0_f64;
+    let mut sum_write_wait = 0.0_f64;
 
     struct DevData {
         name: String,
@@ -558,10 +569,19 @@ fn draw_device_table(
         errors: u64,
         new_errors: u64,
         util_pct: f64,
+        queue_depth: u64,
+        avg_queue_depth: f64,
+        read_iops: f64,
+        write_iops: f64,
+        read_await_ms: f64,
+        write_await_ms: f64,
+        pressure_outlier: bool,
+        pressure_score: f64,
     }
     let mut devs: Vec<DevData> = Vec::new();
 
     if let Some(rates) = &app.rates {
+        let (median_await, median_queue) = metrics::device_pressure_medians(&rates.devices);
         for d in &rates.devices {
             let rv: Vec<f64> = ["user", "btree", "journal", "sb"]
                 .iter()
@@ -578,6 +598,12 @@ fn draw_device_table(
             sr[4] += d.read_bytes_sec;
             sw[4] += d.write_bytes_sec;
             sum_errs += d.io_errors;
+            sum_queue += d.queue_depth;
+            sum_avg_queue += d.avg_queue_depth;
+            sum_read_wait += d.read_await_ms * d.read_iops;
+            sum_write_wait += d.write_await_ms * d.write_iops;
+            sum_read_iops += d.read_iops;
+            sum_write_iops += d.write_iops;
             let baseline = app
                 .initial_errors
                 .get(&d.name)
@@ -599,25 +625,72 @@ fn draw_device_table(
                 errors: d.io_errors,
                 new_errors,
                 util_pct: d.util_pct,
+                queue_depth: d.queue_depth,
+                avg_queue_depth: d.avg_queue_depth,
+                read_iops: d.read_iops,
+                write_iops: d.write_iops,
+                read_await_ms: d.read_await_ms,
+                write_await_ms: d.write_await_ms,
+                pressure_outlier: d.pressure_outlier(median_await, median_queue),
+                pressure_score: d.pressure_score(median_await, median_queue),
             });
         }
     }
 
+    if app.sort_devices_by_pressure {
+        devs.sort_by(|a, b| {
+            b.pressure_score
+                .total_cmp(&a.pressure_score)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+    }
+    let visible_count = area.height.saturating_sub(4).max(1) as usize;
+    let selected = app.device_scroll.min(devs.len().saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible_count)
+        .min(devs.len().saturating_sub(visible_count));
+    let end = (start + visible_count).min(devs.len());
+    let visible_devs = &devs[start..end];
+    let total_read_await = if sum_read_iops > 0.0 {
+        sum_read_wait / sum_read_iops
+    } else {
+        0.0
+    };
+    let total_write_await = if sum_write_iops > 0.0 {
+        sum_write_wait / sum_write_iops
+    } else {
+        0.0
+    };
+
     // Left: Device + Err + Util (with mini bar)
     {
+        let range = if devs.is_empty() {
+            "0/0".to_string()
+        } else {
+            format!("{}-{}/{}", start + 1, end, devs.len())
+        };
+        let sort = if app.sort_devices_by_pressure {
+            "pressure"
+        } else {
+            "order"
+        };
         let block = Block::default()
-            .title(Span::styled(" Devices ", theme::bold(theme::ACCENT)))
+            .title(Span::styled(
+                format!(" Devices {range} [{sort}] "),
+                theme::bold(theme::ACCENT),
+            ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(focus_style);
         let header = if has_labels {
-            Row::new(vec!["Device", "Label", "Err", "Utl"])
+            Row::new(vec!["Device", "Label", "Err", "Utl", "Q", "AQ"])
         } else {
-            Row::new(vec!["Device", "Err", "Utl"])
+            Row::new(vec!["Device", "Err", "Utl", "Q", "AQ"])
         }
         .style(theme::bold(theme::FG));
 
-        let mut rows: Vec<Row> = devs
+        let mut rows: Vec<Row> = visible_devs
             .iter()
             .enumerate()
             .map(|(i, d)| {
@@ -644,24 +717,57 @@ fn draw_device_table(
                     "\u{2014}".into()
                 };
                 let util_cell = Cell::new(util_s).style(Style::default().fg(uc));
-                let row_bg = if i % 2 == 1 {
+                let queue_color = if d.avg_queue_depth >= 2.0 || d.queue_depth > 4 {
+                    theme::RED
+                } else if d.avg_queue_depth >= 1.0 || d.queue_depth > 1 {
+                    theme::YELLOW
+                } else {
+                    theme::FG
+                };
+                let queue = if d.queue_depth > 0 {
+                    d.queue_depth.to_string()
+                } else {
+                    "\u{2014}".to_string()
+                };
+                let avg_queue = if d.avg_queue_depth > 0.0 {
+                    format!("{:.1}", d.avg_queue_depth)
+                } else {
+                    "\u{2014}".to_string()
+                };
+                let device_style = if d.pressure_outlier {
+                    Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::FG)
+                };
+                let device_name = if d.pressure_outlier {
+                    format!("!{}", d.name)
+                } else {
+                    d.name.clone()
+                };
+                let row_bg = if start + i == selected {
+                    Style::default().bg(theme::KEY_BG)
+                } else if (start + i) % 2 == 1 {
                     Style::default().bg(theme::ROW_ALT)
                 } else {
                     Style::default()
                 };
                 if has_labels {
                     Row::new(vec![
-                        Cell::new(d.name.clone()).style(Style::default().fg(theme::FG)),
+                        Cell::new(device_name).style(device_style),
                         Cell::new(d.label.clone().unwrap_or_default()).style(theme::dim()),
                         Cell::new(format!("{}", d.errors)).style(es),
                         util_cell,
+                        Cell::new(queue).style(Style::default().fg(queue_color)),
+                        Cell::new(avg_queue).style(Style::default().fg(queue_color)),
                     ])
                     .style(row_bg)
                 } else {
                     Row::new(vec![
-                        Cell::new(d.name.clone()).style(Style::default().fg(theme::FG)),
+                        Cell::new(device_name).style(device_style),
                         Cell::new(format!("{}", d.errors)).style(es),
                         util_cell,
+                        Cell::new(queue).style(Style::default().fg(queue_color)),
+                        Cell::new(avg_queue).style(Style::default().fg(queue_color)),
                     ])
                     .style(row_bg)
                 }
@@ -681,26 +787,34 @@ fn draw_device_table(
                 Cell::new(""),
                 Cell::new(format!("{}", sum_errs)).style(total_err_style),
                 Cell::new(""),
+                Cell::new(sum_queue.to_string()),
+                Cell::new(format!("{sum_avg_queue:.1}")),
             ]));
         } else {
             rows.push(Row::new(vec![
                 Cell::new("TOTAL").style(total_style),
                 Cell::new(format!("{}", sum_errs)).style(total_err_style),
                 Cell::new(""),
+                Cell::new(sum_queue.to_string()),
+                Cell::new(format!("{sum_avg_queue:.1}")),
             ]));
         }
         let widths = if has_labels {
             vec![
-                Constraint::Length(7),
+                Constraint::Length(8),
                 Constraint::Min(4),
+                Constraint::Length(3),
                 Constraint::Length(4),
-                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Length(4),
             ]
         } else {
             vec![
-                Constraint::Min(6),
+                Constraint::Min(8),
+                Constraint::Length(3),
                 Constraint::Length(4),
-                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Length(4),
             ]
         };
         let table = Table::new(rows, widths).header(header).block(block);
@@ -711,50 +825,83 @@ fn draw_device_table(
     {
         let block =
             rounded_block_styled(Span::styled("READ", theme::bold(theme::READ)), theme::READ);
-        let header = Row::new(vec![
-            "user/s", "btree/s", "jrnl/s", "sb/s", "total/s", "lat",
-        ])
+        let header = Row::new(if detailed_io {
+            vec![
+                "user/s", "btree/s", "jrnl/s", "sb/s", "total/s", "IOPS", "await", "bcLat",
+            ]
+        } else {
+            vec!["total/s", "IOPS", "await", "bcLat"]
+        })
         .style(theme::bold(theme::READ));
         let rs = Style::default().fg(theme::READ);
-        let mut rows: Vec<Row> = devs
+        let mut rows: Vec<Row> = visible_devs
             .iter()
             .enumerate()
             .map(|(i, d)| {
-                let row_bg = if i % 2 == 1 {
+                let row_bg = if start + i == selected {
+                    rs.bg(theme::KEY_BG)
+                } else if (start + i) % 2 == 1 {
                     rs.bg(theme::ROW_ALT)
                 } else {
                     rs
                 };
-                Row::new(vec![
-                    Cell::new(bv(d.rv[0])),
-                    Cell::new(bv(d.rv[1])),
-                    Cell::new(bv(d.rv[2])),
-                    Cell::new(bv(d.rv[3])),
-                    Cell::new(format_bytes_short(d.read_total)),
-                    if d.read_active {
-                        Cell::new(format_latency(d.read_lat))
-                            .style(Style::default().fg(theme::latency_color(d.read_lat)))
-                    } else {
-                        Cell::new("\u{2014}")
-                    },
-                ])
-                .style(row_bg)
+                let await_cell = if d.read_iops > 0.0 {
+                    Cell::new(format_await_ms(d.read_await_ms, true))
+                        .style(Style::default().fg(await_color(d.read_await_ms)))
+                } else {
+                    Cell::new("\u{2014}")
+                };
+                let latency_cell = if d.read_active {
+                    Cell::new(format_latency(d.read_lat))
+                        .style(Style::default().fg(theme::latency_color(d.read_lat)))
+                } else {
+                    Cell::new("\u{2014}")
+                };
+                let cells = if detailed_io {
+                    vec![
+                        Cell::new(bv(d.rv[0])),
+                        Cell::new(bv(d.rv[1])),
+                        Cell::new(bv(d.rv[2])),
+                        Cell::new(bv(d.rv[3])),
+                        Cell::new(format_bytes_short(d.read_total)),
+                        Cell::new(format_iops(d.read_iops)),
+                        await_cell,
+                        latency_cell,
+                    ]
+                } else {
+                    vec![
+                        Cell::new(format_bytes_short(d.read_total)),
+                        Cell::new(format_iops(d.read_iops)),
+                        await_cell,
+                        latency_cell,
+                    ]
+                };
+                Row::new(cells).style(row_bg)
             })
             .collect();
         let bs = theme::bold(theme::READ);
-        rows.push(
-            Row::new(vec![
+        let total_cells = if detailed_io {
+            vec![
                 Cell::new(bv(sr[0])),
                 Cell::new(bv(sr[1])),
                 Cell::new(bv(sr[2])),
                 Cell::new(bv(sr[3])),
                 Cell::new(format_bytes_short(sr[4])),
+                Cell::new(format_iops(sum_read_iops)),
+                Cell::new(format_await_ms(total_read_await, sum_read_iops > 0.0)),
                 Cell::new(""),
-            ])
-            .style(bs),
-        );
-        let w = Constraint::Ratio(1, 6);
-        let widths = [w, w, w, w, w, w];
+            ]
+        } else {
+            vec![
+                Cell::new(format_bytes_short(sr[4])),
+                Cell::new(format_iops(sum_read_iops)),
+                Cell::new(format_await_ms(total_read_await, sum_read_iops > 0.0)),
+                Cell::new(""),
+            ]
+        };
+        rows.push(Row::new(total_cells).style(bs));
+        let column_count = if detailed_io { 8 } else { 4 };
+        let widths = vec![Constraint::Ratio(1, column_count); column_count as usize];
         let table = Table::new(rows, widths).header(header).block(block);
         f.render_widget(table, dev_cols[1]);
     }
@@ -765,50 +912,83 @@ fn draw_device_table(
             Span::styled("WRITE", theme::bold(theme::WRITE)),
             theme::WRITE,
         );
-        let header = Row::new(vec![
-            "user/s", "btree/s", "jrnl/s", "sb/s", "total/s", "lat",
-        ])
+        let header = Row::new(if detailed_io {
+            vec![
+                "user/s", "btree/s", "jrnl/s", "sb/s", "total/s", "IOPS", "await", "bcLat",
+            ]
+        } else {
+            vec!["total/s", "IOPS", "await", "bcLat"]
+        })
         .style(theme::bold(theme::WRITE));
         let ws = Style::default().fg(theme::WRITE);
-        let mut rows: Vec<Row> = devs
+        let mut rows: Vec<Row> = visible_devs
             .iter()
             .enumerate()
             .map(|(i, d)| {
-                let row_bg = if i % 2 == 1 {
+                let row_bg = if start + i == selected {
+                    ws.bg(theme::KEY_BG)
+                } else if (start + i) % 2 == 1 {
                     ws.bg(theme::ROW_ALT)
                 } else {
                     ws
                 };
-                Row::new(vec![
-                    Cell::new(bv(d.wv[0])),
-                    Cell::new(bv(d.wv[1])),
-                    Cell::new(bv(d.wv[2])),
-                    Cell::new(bv(d.wv[3])),
-                    Cell::new(format_bytes_short(d.write_total)),
-                    if d.write_active {
-                        Cell::new(format_latency(d.write_lat))
-                            .style(Style::default().fg(theme::latency_color(d.write_lat)))
-                    } else {
-                        Cell::new("\u{2014}")
-                    },
-                ])
-                .style(row_bg)
+                let await_cell = if d.write_iops > 0.0 {
+                    Cell::new(format_await_ms(d.write_await_ms, true))
+                        .style(Style::default().fg(await_color(d.write_await_ms)))
+                } else {
+                    Cell::new("\u{2014}")
+                };
+                let latency_cell = if d.write_active {
+                    Cell::new(format_latency(d.write_lat))
+                        .style(Style::default().fg(theme::latency_color(d.write_lat)))
+                } else {
+                    Cell::new("\u{2014}")
+                };
+                let cells = if detailed_io {
+                    vec![
+                        Cell::new(bv(d.wv[0])),
+                        Cell::new(bv(d.wv[1])),
+                        Cell::new(bv(d.wv[2])),
+                        Cell::new(bv(d.wv[3])),
+                        Cell::new(format_bytes_short(d.write_total)),
+                        Cell::new(format_iops(d.write_iops)),
+                        await_cell,
+                        latency_cell,
+                    ]
+                } else {
+                    vec![
+                        Cell::new(format_bytes_short(d.write_total)),
+                        Cell::new(format_iops(d.write_iops)),
+                        await_cell,
+                        latency_cell,
+                    ]
+                };
+                Row::new(cells).style(row_bg)
             })
             .collect();
         let bs = theme::bold(theme::WRITE);
-        rows.push(
-            Row::new(vec![
+        let total_cells = if detailed_io {
+            vec![
                 Cell::new(bv(sw[0])),
                 Cell::new(bv(sw[1])),
                 Cell::new(bv(sw[2])),
                 Cell::new(bv(sw[3])),
                 Cell::new(format_bytes_short(sw[4])),
+                Cell::new(format_iops(sum_write_iops)),
+                Cell::new(format_await_ms(total_write_await, sum_write_iops > 0.0)),
                 Cell::new(""),
-            ])
-            .style(bs),
-        );
-        let w = Constraint::Ratio(1, 6);
-        let widths = [w, w, w, w, w, w];
+            ]
+        } else {
+            vec![
+                Cell::new(format_bytes_short(sw[4])),
+                Cell::new(format_iops(sum_write_iops)),
+                Cell::new(format_await_ms(total_write_await, sum_write_iops > 0.0)),
+                Cell::new(""),
+            ]
+        };
+        rows.push(Row::new(total_cells).style(bs));
+        let column_count = if detailed_io { 8 } else { 4 };
+        let widths = vec![Constraint::Ratio(1, column_count); column_count as usize];
         let table = Table::new(rows, widths).header(header).block(block);
         f.render_widget(table, dev_cols[2]);
     }
@@ -932,7 +1112,7 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame) {
     let area = f.area();
     let w = 50u16.min(area.width.saturating_sub(4));
-    let h = 26u16.min(area.height.saturating_sub(4));
+    let h = 28u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -971,6 +1151,10 @@ fn draw_help(f: &mut Frame) {
             "  f  cycle filesystem",
             Style::default().fg(theme::FG),
         )),
+        Line::from(Span::styled(
+            "  s  toggle pressure / filesystem device order",
+            Style::default().fg(theme::FG),
+        )),
         Line::from(""),
         Line::from(Span::styled("Toggles", theme::bold(theme::ACCENT))),
         Line::from(Span::styled(
@@ -988,7 +1172,7 @@ fn draw_help(f: &mut Frame) {
             Style::default().fg(theme::FG),
         )),
         Line::from(Span::styled(
-            "  \u{2191}\u{2193} / jk  navigate / scroll views",
+            "  \u{2191}\u{2193} / jk  navigate / scroll devices and views",
             Style::default().fg(theme::FG),
         )),
         Line::from(Span::styled(
@@ -1064,6 +1248,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.extend(key_hint("c", "counters"));
         spans.extend(key_hint("t", "blocked"));
         spans.extend(key_hint("p", "procs"));
+        if area.width >= 100 {
+            spans.extend(key_hint("s", "sort"));
+        }
         spans.extend(key_hint("r", "reconcile"));
         spans.extend(key_hint("g", "copygc"));
         spans.extend(key_hint("f", "fs"));
@@ -1343,6 +1530,42 @@ fn format_bytes_short(v: f64) -> String {
     }
 }
 
+fn format_iops(iops: f64) -> String {
+    if iops <= 0.0 {
+        "\u{2014}".to_string()
+    } else if iops < 1.0 {
+        "<1".to_string()
+    } else if iops >= 1_000.0 {
+        format!("{:.1}k", iops / 1_000.0)
+    } else {
+        format!("{iops:.0}")
+    }
+}
+
+fn format_await_ms(ms: f64, active: bool) -> String {
+    if !active {
+        "\u{2014}".to_string()
+    } else if ms < 0.1 {
+        "<0.1".to_string()
+    } else if ms < 1.0 {
+        format!("{ms:.1}")
+    } else {
+        format!("{ms:.0}")
+    }
+}
+
+fn await_color(ms: f64) -> Color {
+    if ms < 5.0 {
+        theme::GREEN
+    } else if ms < 20.0 {
+        theme::YELLOW
+    } else if ms < 100.0 {
+        theme::ORANGE
+    } else {
+        theme::RED
+    }
+}
+
 fn format_latency(ns: u64) -> String {
     if ns >= 1_000_000_000 {
         format!("{:.1} s", ns as f64 / 1_000_000_000.0)
@@ -1410,5 +1633,11 @@ mod tests {
     fn counter_rate_uses_actual_sample_interval() {
         assert_eq!(counter_per_second(20, 10.0), 2.0);
         assert_eq!(counter_per_second(20, 0.0), 0.0);
+    }
+
+    #[test]
+    fn await_format_distinguishes_fast_io_from_no_sample() {
+        assert_eq!(format_await_ms(0.0, true), "<0.1");
+        assert_eq!(format_await_ms(0.0, false), "\u{2014}");
     }
 }

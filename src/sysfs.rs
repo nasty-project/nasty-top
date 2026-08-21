@@ -32,6 +32,27 @@ pub struct DeviceInfo {
     pub diskstats_reads: u64,
     /// Completed write ops (from /proc/diskstats).
     pub diskstats_writes: u64,
+    /// Milliseconds spent servicing reads and writes.
+    pub diskstats_read_ms: u64,
+    pub diskstats_write_ms: u64,
+    /// Instantaneous requests currently in the block layer.
+    pub diskstats_in_flight: u64,
+    /// Weighted milliseconds doing I/O, used to derive average queue depth.
+    pub diskstats_weighted_io_ms: u64,
+    /// Whether this snapshot contained a complete parseable diskstats row.
+    pub diskstats_valid: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DiskStats {
+    reads: u64,
+    writes: u64,
+    read_ms: u64,
+    write_ms: u64,
+    in_flight: u64,
+    io_ms: u64,
+    weighted_io_ms: u64,
+    valid: bool,
 }
 
 /// Full time_stats entry from JSON.
@@ -281,6 +302,32 @@ mod tests {
             (32 * 1024 * 1024, 12 * 1024 * 1024, 2 * 1024 * 1024)
         );
     }
+
+    #[test]
+    fn parses_diskstats_request_and_queue_fields() {
+        let diskstats = "   8       0 sda 100 5 2000 400 50 2 1000 600 3 700 900 0 0 0 0\n";
+        assert_eq!(
+            parse_diskstats_for(diskstats, "sda"),
+            DiskStats {
+                reads: 100,
+                writes: 50,
+                read_ms: 400,
+                write_ms: 600,
+                in_flight: 3,
+                io_ms: 700,
+                weighted_io_ms: 900,
+                valid: true,
+            }
+        );
+        assert_eq!(parse_diskstats_for(diskstats, "sdb"), DiskStats::default());
+        assert_eq!(
+            parse_diskstats_for(
+                "8 0 sda invalid 5 2000 400 50 2 1000 600 3 700 900\n",
+                "sda"
+            ),
+            DiskStats::default()
+        );
+    }
 }
 
 /// Read the block device name (e.g. "nvme0n1p1") from a bcachefs sysfs dev-N directory.
@@ -385,7 +432,7 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
 
         let (io_read, io_write, io_read_by_type, io_write_by_type) = read_io_done(&dev_path);
         let io_errors = read_io_errors(&dev_path);
-        let (ds_reads, ds_writes, ds_io_ms) = read_diskstats_for(&dev_name);
+        let diskstats = read_diskstats_for(&dev_name);
 
         devices.push(DeviceInfo {
             index,
@@ -398,9 +445,14 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
             io_read_by_type,
             io_write_by_type,
             io_errors,
-            diskstats_io_ms: ds_io_ms,
-            diskstats_reads: ds_reads,
-            diskstats_writes: ds_writes,
+            diskstats_io_ms: diskstats.io_ms,
+            diskstats_reads: diskstats.reads,
+            diskstats_writes: diskstats.writes,
+            diskstats_read_ms: diskstats.read_ms,
+            diskstats_write_ms: diskstats.write_ms,
+            diskstats_in_flight: diskstats.in_flight,
+            diskstats_weighted_io_ms: diskstats.weighted_io_ms,
+            diskstats_valid: diskstats.valid,
         });
     }
     // Sort by (label, natural device name) so labeled groups stay together
@@ -633,19 +685,40 @@ fn read_memory_info() -> (u64, u64, u64) {
     parse_memory_info(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default())
 }
 
-/// Read per-device stats from /proc/diskstats: (reads_completed, writes_completed, io_ms).
-fn read_diskstats_for(dev_name: &str) -> (u64, u64, u64) {
-    let content = std::fs::read_to_string("/proc/diskstats").unwrap_or_default();
-    for line in content.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 14 && fields[2] == dev_name {
-            let reads: u64 = fields[3].parse().unwrap_or(0);
-            let writes: u64 = fields[7].parse().unwrap_or(0);
-            let io_ms: u64 = fields[12].parse().unwrap_or(0);
-            return (reads, writes, io_ms);
-        }
+fn parse_diskstats_for(content: &str, dev_name: &str) -> DiskStats {
+    // Fields after major/minor/name follow Documentation/admin-guide/iostats.rst.
+    // We need through field 11 (weighted milliseconds doing I/O).
+    let Some(fields) = content
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|fields| fields.len() >= 14 && fields[2] == dev_name)
+    else {
+        return DiskStats::default();
+    };
+
+    let parsed = [3, 6, 7, 10, 11, 12, 13]
+        .map(|index| fields[index].parse::<u64>())
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(values) = parsed else {
+        return DiskStats::default();
+    };
+    DiskStats {
+        reads: values[0],
+        read_ms: values[1],
+        writes: values[2],
+        write_ms: values[3],
+        in_flight: values[4],
+        io_ms: values[5],
+        weighted_io_ms: values[6],
+        valid: true,
     }
-    (0, 0, 0)
+}
+
+/// Read per-device request, timing, utilization, and queue statistics.
+fn read_diskstats_for(dev_name: &str) -> DiskStats {
+    let content = std::fs::read_to_string("/proc/diskstats").unwrap_or_default();
+    parse_diskstats_for(&content, dev_name)
 }
 
 /// Read CPU iowait from /proc/stat. Returns (iowait_jiffies, total_jiffies).
