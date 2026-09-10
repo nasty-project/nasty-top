@@ -1,0 +1,12 @@
+capacity               1096893915055
+used                   1020555325423
+reserved               95382079569
+hidden                 843813888
+btree                  7821903360
+data                   1012034114216
+cached                 32094314649
+reserved               688526736
+online_reserved        22528
+
+freelist_wait          empty
+btree reserve cache    1

@@ -1,0 +1,14 @@
+            buckets         sectors         fragmented
+free        100             0               0
+sb          1               8               0
+journal     20              40960           0
+btree       500             900000          124000
+user        200             300000          109600
+cached      50              90000           12400
+parity      0               0               0
+need_discard 129            0               0
+capacity    1000
+
+reserves:
+btree       17
+stripe      32

@@ -51,6 +51,8 @@ pub struct App {
     pub show_options: bool,
     pub show_processes: bool,
     pub show_blocked: bool,
+    pub show_targets: bool,
+    pub target_reports: Vec<crate::targets::TargetReport>,
     pub prev_proc_io: Vec<ProcessIo>,
     pub process_rates: Vec<ProcessRate>,
     /// Recent stall events (newest first, capped at 10).
@@ -61,9 +63,9 @@ pub struct App {
     /// display time so triggers that fire for a single tick stay visible
     /// long enough to read.
     pub proposal_first_shown: Option<Instant>,
-    /// Temporarily dismissed: (option_name, dismissed_at).
+    /// Temporarily dismissed: (finding_id, dismissed_at).
     pub dismissed_temp: Vec<(String, std::time::Instant)>,
-    /// Permanently dismissed option names ("don't ask again").
+    /// Permanently dismissed finding IDs ("don't ask again").
     pub dismissed_permanent: std::collections::HashSet<String>,
     /// Blocked stats delta per tick: (name, delta_count, recent_mean_us).
     pub blocked_deltas: Vec<(String, u64, f64)>,
@@ -94,6 +96,7 @@ impl App {
         let fs = all_fs[fs_index].clone();
         let snap = sysfs::snapshot(&fs);
         let tuning = TuningState::new(&snap.options);
+        let target_reports = crate::targets::analyze(&snap);
         let initial_errors = snap
             .devices
             .iter()
@@ -117,6 +120,8 @@ impl App {
             show_options: false,
             show_processes: false,
             show_blocked: false,
+            show_targets: false,
+            target_reports,
             prev_proc_io: sysfs::read_all_process_io(),
             process_rates: Vec::new(),
             stall_events: Vec::new(),
@@ -145,7 +150,7 @@ impl App {
         self.last_tick = now;
         self.sample_interval = dt;
 
-        let new_snap = sysfs::snapshot(&self.fs);
+        let new_snap = sysfs::snapshot_after(&self.fs, Some(&self.current));
 
         // Baseline error counts for any newly-appearing devices so we
         // don't flag pre-existing errors on a device added mid-session.
@@ -367,6 +372,7 @@ impl App {
             });
 
         self.previous = Some(std::mem::replace(&mut self.current, new_snap));
+        self.target_reports = crate::targets::analyze(&self.current);
         self.rates = Some(rates);
         self.device_scroll = self.device_scroll.min(
             self.rates
@@ -381,7 +387,7 @@ impl App {
         const MIN_HINT_DISPLAY: std::time::Duration = std::time::Duration::from_secs(15);
         let new_proposal = crate::advisor::evaluate(self);
         match (self.proposal.as_ref(), new_proposal) {
-            (Some(curr), Some(new)) if curr.option == new.option => {
+            (Some(curr), Some(new)) if curr.id == new.id => {
                 self.proposal = Some(new);
             }
             (_, Some(new)) => {
@@ -495,6 +501,7 @@ impl App {
             .map(|d| (d.name.clone(), d.io_errors))
             .collect();
         self.current = snap;
+        self.target_reports = crate::targets::analyze(&self.current);
         self.previous = None;
         self.rates = None;
         self.last_tick = Instant::now();
@@ -536,8 +543,10 @@ impl App {
 
     pub fn dismiss_proposal(&mut self) {
         if let Some(ref p) = self.proposal {
-            self.dismissed_temp
-                .push((p.option.clone(), std::time::Instant::now()));
+            self.dismissed_temp.push((
+                format!("{}:{}", self.fs.uuid, p.id),
+                std::time::Instant::now(),
+            ));
         }
         self.proposal = None;
         self.proposal_first_shown = None;
@@ -546,10 +555,11 @@ impl App {
 
     pub fn dismiss_permanent(&mut self) {
         if let Some(ref p) = self.proposal {
-            self.dismissed_permanent.insert(p.option.clone());
+            self.dismissed_permanent
+                .insert(format!("{}:{}", self.fs.uuid, p.id));
             self.set_status(format!(
                 "Won't hint about {} again (press C to clear)",
-                p.option
+                p.id
             ));
         }
         self.proposal = None;
@@ -564,12 +574,13 @@ impl App {
     }
 
     pub fn is_dismissed(&self, option: &str) -> bool {
-        if self.dismissed_permanent.contains(option) {
+        let key = format!("{}:{option}", self.fs.uuid);
+        if self.dismissed_permanent.contains(&key) {
             return true;
         }
         self.dismissed_temp
             .iter()
-            .any(|(name, when)| name == option && when.elapsed().as_secs() < 120)
+            .any(|(name, when)| name == &key && when.elapsed().as_secs() < 120)
     }
 
     pub fn handle_enter(&mut self) {
