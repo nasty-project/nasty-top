@@ -1,5 +1,8 @@
 //! bcachefs discovery and sysfs reading.
 
+use crate::targets::{
+    CopyGcStatus, MemberAllocation, ReconcileStatus, ReconcileWork, TargetConfig,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +21,7 @@ pub struct DeviceInfo {
     pub index: u32,
     pub name: String,
     pub label: Option<String>,
+    pub allocation: MemberAllocation,
     pub io_latency_read_ns: u64,
     pub io_latency_write_ns: u64,
     pub io_done_read: u64,
@@ -98,6 +102,14 @@ pub struct FsSnapshot {
     /// Kernel-reported btree-node main buffers for this filesystem. Included
     /// node states vary by module version; this is not all bcachefs memory.
     pub btree_cache_size_bytes: Option<u64>,
+    /// Accounted on-disk btree sectors converted to bytes, already replicated.
+    pub btree_disk_bytes: Option<u64>,
+    pub target_configs: Vec<TargetConfig>,
+    pub reconcile: ReconcileStatus,
+    pub copygc: CopyGcStatus,
+    /// Slow allocator tables are refreshed at most every ten seconds unless
+    /// membership or runtime options change. Never reused across filesystems.
+    pub allocation_sampled_at: Option<std::time::Instant>,
 }
 
 /// Discover mounted bcachefs filesystems.
@@ -226,6 +238,166 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn collects_member_capacity_and_refreshes_cached_usage_on_state_change() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(std::env::temp_dir().join(
+            format!("nasty-top-allocation-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()),
+        ));
+        for dir in ["options", "internal", "dev-31", "backing"] {
+            std::fs::create_dir_all(fixture.0.join(dir)).unwrap();
+        }
+        for (name, value) in [
+            ("options/metadata_target", "ssd.nvme"),
+            ("options/metadata_replicas", "3"),
+            ("options/reconcile_enabled", "0"),
+            ("dev-31/dev", "nvme0n1p3"),
+            ("dev-31/label", "ssd.nvme.31"),
+            ("dev-31/state", "[rw] ro failed spare"),
+            ("dev-31/durability", "1"),
+            ("dev-31/data_allowed", "journal,btree,user"),
+            ("dev-31/bucket_size", "1.00M"),
+            ("dev-31/nbuckets", "1000"),
+            ("backing/size", "99999999999"),
+            (
+                "dev-31/alloc_debug",
+                include_str!("fixtures/member-alloc-debug.txt"),
+            ),
+            (
+                "internal/alloc_debug",
+                include_str!("fixtures/fs-alloc-debug.txt"),
+            ),
+        ] {
+            std::fs::write(fixture.0.join(name), value).unwrap();
+        }
+        symlink("../backing", fixture.0.join("dev-31/block")).unwrap();
+        let fs = BcachefsFs {
+            uuid: "fixture".into(),
+            mount_point: "/".into(),
+            fs_name: "fixture".into(),
+            sysfs: fixture.0.clone(),
+        };
+        let first = snapshot(&fs);
+        assert_eq!(first.devices[0].allocation.state.as_deref(), Some("rw"));
+        assert_eq!(first.devices[0].allocation.online, Some(true));
+        assert_eq!(first.devices[0].allocation.capacity_bytes, Some(1000 << 20)); // member, not entire backing disk
+        assert_eq!(first.devices[0].allocation.free_bytes, Some(100 << 20));
+        assert_eq!(first.btree_disk_bytes, Some(7_821_903_360 * 512));
+        std::fs::write(fixture.0.join("dev-31/nbuckets"), "2000").unwrap();
+        std::fs::write(fixture.0.join("internal/alloc_debug"), "btree 1\n").unwrap();
+        let cached = snapshot_after(&fs, Some(&first));
+        assert_eq!(
+            cached.devices[0].allocation.capacity_bytes,
+            Some(1000 << 20)
+        );
+        assert_eq!(cached.btree_disk_bytes, first.btree_disk_bytes);
+        std::fs::write(fixture.0.join("dev-31/state"), "rw [ro] failed spare").unwrap();
+        let fresh = snapshot_after(&fs, Some(&cached));
+        assert_eq!(fresh.devices[0].allocation.state.as_deref(), Some("ro"));
+        assert_eq!(fresh.devices[0].allocation.capacity_bytes, Some(2000 << 20));
+        assert_eq!(fresh.btree_disk_bytes, Some(512));
+        std::fs::remove_file(fixture.0.join("dev-31/alloc_debug")).unwrap();
+        let mut expired = fresh;
+        expired.allocation_sampled_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+        let missing = snapshot_after(&fs, Some(&expired));
+        assert_eq!(missing.devices[0].allocation.free_bytes, None); // never reuse stale success after a failed refresh
+    }
+
+    #[test]
+    fn reconcile_keeps_metadata_backlog_and_does_not_treat_parent_wait_as_idle() {
+        let status = parse_reconcile_status(include_str!("fixtures/reconcile-status.txt"));
+        assert_eq!(status.state.as_deref(), Some("working"));
+        assert_eq!(
+            status.metadata_pending("target"),
+            parse_human_bytes("1.16T")
+        );
+        assert_eq!(status.metadata_pending("replicas"), Some(0));
+        assert!(
+            status
+                .summary()
+                .contains("target:data=124.00 GiB meta=1.16 TiB")
+        );
+        assert_eq!(status.scan_pending, Some(0));
+    }
+
+    #[test]
+    fn reconcile_handles_metadata_only_reordered_and_partial_columns() {
+        let status = parse_reconcile_status(
+            "Scan pending: 2\nmetadata data\ntarget: 1.16T 0\nprocessing 12.5%\n",
+        );
+        assert_eq!(
+            status.metadata_pending("target"),
+            parse_human_bytes("1.16T")
+        );
+        assert!(status.summary().contains("working 12.5%"));
+        assert!(status.summary().contains("scans:2"));
+        assert!(status.summary().contains("target:data=0 B meta=1.16 TiB"));
+        let partial = parse_reconcile_status("data metadata\ntarget: 124G\n");
+        assert_eq!(partial.metadata_pending("target"), None);
+        assert!(partial.summary().contains("meta=?"));
+        for content in [
+            "",
+            "permission denied",
+            "WARNING: no kernel support\nplease alert upstream",
+        ] {
+            assert_eq!(parse_reconcile_status(content).summary(), "n/a");
+        }
+    }
+
+    #[test]
+    fn gc_pressure_uses_only_signed_device_waits_not_global_wait() {
+        let status = parse_copygc_status(include_str!("fixtures/copy-gc-wait.txt"));
+        assert_eq!(status.running, Some(true));
+        assert_eq!(status.needs_gc.get("nvme1n1p3"), Some(&true));
+        assert_eq!(status.needs_gc.get("nvme2n1"), Some(&false));
+        assert!(!status.needs_gc.contains_key("Currently waiting for"));
+        assert!(!status.needs_gc.contains_key("unreported"));
+        let truncated = parse_copygc_status(
+            "running: invalid\nCurrently calculated wait:\n dev-2: 0\n dev-3: -\n",
+        );
+        assert_eq!(truncated.running, None);
+        assert_eq!(truncated.needs_gc.get("dev-2"), Some(&true));
+        assert!(!truncated.needs_gc.contains_key("dev-3"));
+    }
+
+    #[test]
+    fn allocator_units_distinguish_free_buckets_live_sectors_and_replica_footprint() {
+        assert_eq!(
+            parse_btree_disk_bytes(include_str!("fixtures/fs-alloc-debug.txt")),
+            Some(7_821_903_360 * 512)
+        );
+        assert_eq!(parse_btree_disk_bytes("btree invalid\n"), None);
+        assert_eq!(parse_btree_disk_bytes("btree 18446744073709551615\n"), None);
+        let mut allocation = MemberAllocation::default();
+        parse_member_usage(
+            include_str!("fixtures/member-alloc-debug.txt"),
+            Some(1 << 20),
+            &mut allocation,
+        );
+        assert_eq!(allocation.free_bytes, Some(100 << 20));
+        assert_eq!(allocation.btree_bytes, Some(900_000 * 512));
+        assert_eq!(
+            allocation.fragmented_bytes,
+            Some((124_000 + 109_600 + 12_400) * 512)
+        );
+        let mut unknown = MemberAllocation::default();
+        parse_member_usage(
+            "buckets sectors fragmented\nfree 100 0 0\nbtree 500 900000 124000\n",
+            None,
+            &mut unknown,
+        );
+        assert_eq!(unknown.free_bytes, None);
+        assert_eq!(unknown.btree_bytes, Some(900_000 * 512));
+        assert_eq!(unknown.fragmented_bytes, None); // table did not finish
+    }
+
+    #[test]
     fn finds_by_uuid_mount_without_member_device_matching() {
         let mounts = bcachefs_mounts(
             "/dev/disk/by-uuid/6ecff1be-9388-482d-a9fd-f1ff6e29a823 /fs/first bcachefs rw 0 0\n",
@@ -340,11 +512,83 @@ fn read_dev_name(dev_dir: &Path) -> Option<String> {
 
 /// Read all metrics for a filesystem.
 pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
+    snapshot_after(fs, None)
+}
+
+pub fn snapshot_after(fs: &BcachefsFs, previous: Option<&FsSnapshot>) -> FsSnapshot {
     let (iowait, cpu_total) = read_cpu_iowait();
     let (journal_fill, journal_watermark) = read_journal_fill(&fs.sysfs);
     let (memory_total_bytes, memory_available_bytes, kernel_reclaimable_bytes) = read_memory_info();
 
     let (space_total, space_used) = read_fs_space(&fs.mount_point);
+    let options = read_options(&fs.sysfs);
+    let mut devices = read_devices(&fs.sysfs);
+    let reuse_allocation = previous.filter(|previous| {
+        previous.options == options
+            && previous
+                .allocation_sampled_at
+                .is_some_and(|time| time.elapsed().as_secs() < 10)
+            && previous.devices.len() == devices.len()
+            && devices.iter().all(|d| {
+                previous.devices.iter().any(|p| {
+                    p.index == d.index
+                        && p.name == d.name
+                        && p.label == d.label
+                        && p.allocation.state == d.allocation.state
+                        && p.allocation.online == d.allocation.online
+                        && p.allocation.durability == d.allocation.durability
+                        && p.allocation.data_allowed == d.allocation.data_allowed
+                })
+            })
+    });
+    for device in &mut devices {
+        if let Some(previous) = reuse_allocation {
+            device.allocation = previous
+                .devices
+                .iter()
+                .find(|d| d.index == device.index)
+                .unwrap()
+                .allocation
+                .clone();
+        } else {
+            let path = fs.sysfs.join(format!("dev-{}", device.index));
+            read_member_usage(&path, &mut device.allocation);
+        }
+    }
+    let copygc = read_file_string(&fs.sysfs.join("internal/copy_gc_wait"))
+        .or_else(|| read_file_string(&fs.sysfs.join("internal/copygc_status")))
+        .map(|s| parse_copygc_status(&s))
+        .unwrap_or_default();
+    let reconcile = if options.get("reconcile_enabled").is_some_and(|v| v == "1") {
+        read_reconcile_status(&fs.mount_point)
+    } else {
+        ReconcileStatus {
+            state: options
+                .get("reconcile_enabled")
+                .filter(|v| *v == "0")
+                .map(|_| "off".into()),
+            ..Default::default()
+        }
+    };
+    let target_configs = ["metadata", "foreground", "background", "promote"]
+        .into_iter()
+        .filter_map(|role| {
+            let target = options.get(&format!("{role}_target"))?.clone();
+            let device_name = if target.starts_with('/') {
+                std::fs::canonicalize(&target)
+                    .ok()
+                    .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            } else {
+                None
+            };
+            Some(TargetConfig {
+                role,
+                target,
+                device_name,
+            })
+        })
+        .collect();
+    let background = read_background(&fs.sysfs, &reconcile, &copygc);
 
     FsSnapshot {
         counters: read_counters(&fs.sysfs),
@@ -354,11 +598,11 @@ pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
         btree_read_count: read_time_stat_count(&fs.sysfs, "btree_node_read"),
         blocked_stats: read_blocked_stats(&fs.sysfs),
         all_time_stats: read_all_time_stats_json(&fs.sysfs),
-        devices: read_devices(&fs.sysfs),
+        devices,
         space_total,
         space_used,
-        options: read_options(&fs.sysfs),
-        background: read_background(&fs.sysfs, &fs.mount_point),
+        options,
+        background,
         cpu_iowait: iowait,
         cpu_total,
         journal_fill,
@@ -368,6 +612,17 @@ pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
         kernel_reclaimable_bytes,
         btree_cache_size_bytes: read_file_string(&fs.sysfs.join("btree_cache_size"))
             .and_then(|value| parse_human_bytes(&value)),
+        btree_disk_bytes: match reuse_allocation {
+            Some(previous) => previous.btree_disk_bytes,
+            None => read_file_string(&fs.sysfs.join("internal/alloc_debug"))
+                .and_then(|s| parse_btree_disk_bytes(&s)),
+        },
+        allocation_sampled_at: reuse_allocation
+            .and_then(|s| s.allocation_sampled_at)
+            .or_else(|| Some(std::time::Instant::now())),
+        target_configs,
+        reconcile,
+        copygc,
     }
 }
 
@@ -398,6 +653,143 @@ fn read_dir_u64_files(dir: &Path) -> HashMap<String, u64> {
         }
     }
     map
+}
+
+fn parse_btree_disk_bytes(content: &str) -> Option<u64> {
+    content.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "btree").then_some(())?;
+        fields.next()?.parse::<u64>().ok()?.checked_mul(512)
+    })
+}
+
+fn parse_copygc_status(content: &str) -> CopyGcStatus {
+    let mut status = CopyGcStatus::default();
+    let mut in_devices = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("running:") {
+            status.running = match value.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+        }
+        if line == "Currently calculated wait:" {
+            in_devices = true;
+            continue;
+        }
+        if in_devices {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            if let Some(magnitude) = parse_human_bytes(value.strip_prefix('-').unwrap_or(value)) {
+                status
+                    .needs_gc
+                    .insert(name.trim().into(), value.starts_with('-') || magnitude == 0);
+            }
+        }
+    }
+    status
+}
+
+/// dev-N/alloc_debug has a raw buckets/sectors/fragmented table. Free space is
+/// free *buckets* times bucket size, not its (usually zero) live-sectors column.
+fn parse_member_usage(content: &str, bucket_bytes: Option<u64>, allocation: &mut MemberAllocation) {
+    let mut in_table = false;
+    let mut fragmented = Some(0u64);
+    for line in content.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields == ["buckets", "sectors", "fragmented"] {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        if fields.first() == Some(&"capacity") {
+            allocation.fragmented_bytes = fragmented;
+            break;
+        }
+        if fields.is_empty() {
+            continue;
+        }
+        if fields.len() != 4 {
+            break; // Different format or truncated table: no total fragment count.
+        }
+        let buckets = fields[1].parse::<u64>().ok();
+        let sectors = fields[2]
+            .parse::<u64>()
+            .ok()
+            .and_then(|s| s.checked_mul(512));
+        let frag = fields[3]
+            .parse::<u64>()
+            .ok()
+            .and_then(|s| s.checked_mul(512));
+        fragmented = fragmented
+            .zip(frag)
+            .and_then(|(total, value)| total.checked_add(value));
+        match fields[0] {
+            "free" => {
+                allocation.free_bytes = buckets
+                    .zip(bucket_bytes)
+                    .and_then(|(n, size)| n.checked_mul(size))
+            }
+            "btree" => allocation.btree_bytes = sectors,
+            _ => {}
+        }
+    }
+}
+
+fn read_member_usage(path: &Path, allocation: &mut MemberAllocation) {
+    let bucket_bytes = read_file_string(&path.join("bucket_size"))
+        .and_then(|s| parse_human_bytes(&s))
+        .filter(|n| *n > 0);
+    let nbuckets = read_file_string(&path.join("nbuckets")).and_then(|s| s.parse::<u64>().ok());
+    allocation.capacity_bytes = nbuckets
+        .zip(bucket_bytes)
+        .and_then(|(n, size)| n.checked_mul(size));
+    if let Some(content) = read_file_string(&path.join("alloc_debug")) {
+        parse_member_usage(&content, bucket_bytes, allocation);
+    }
+}
+
+fn read_member_allocation(path: &Path) -> MemberAllocation {
+    let state = read_file_string(&path.join("state")).and_then(|s| {
+        let value = s
+            .split_whitespace()
+            .find_map(|v| v.strip_prefix('[')?.strip_suffix(']'))
+            .unwrap_or(&s);
+        ["rw", "ro", "failed", "spare"]
+            .contains(&value)
+            .then(|| value.to_string())
+    });
+    let data_allowed = read_file_string(&path.join("data_allowed")).and_then(|s| {
+        if s == "none" || s == "(none)" {
+            return Some(Vec::new());
+        }
+        let types: Vec<String> = s
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        types
+            .iter()
+            .all(|t| ["journal", "btree", "user"].contains(&t.as_str()))
+            .then_some(types)
+    });
+    MemberAllocation {
+        state,
+        data_allowed,
+        durability: read_file_string(&path.join("durability")).and_then(|s| s.parse().ok()),
+        online: match std::fs::read_link(path.join("block")) {
+            Ok(_) => Some(path.join("block").exists()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        },
+        ..Default::default()
+    }
 }
 
 fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
@@ -438,6 +830,7 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
             index,
             name: dev_name,
             label,
+            allocation: read_member_allocation(&dev_path),
             io_latency_read_ns: read_lat,
             io_latency_write_ns: write_lat,
             io_done_read: io_read,
@@ -568,21 +961,17 @@ fn read_options(sysfs: &Path) -> HashMap<String, String> {
     map
 }
 
-fn read_background(sysfs: &Path, mount_point: &str) -> Vec<(String, String)> {
+fn read_background(
+    sysfs: &Path,
+    reconcile: &ReconcileStatus,
+    copygc: &CopyGcStatus,
+) -> Vec<(String, String)> {
     let dir = sysfs.join("internal");
     let opts = sysfs.join("options");
     // Fixed order for stable rendering
     let mut result = Vec::new();
 
-    // Reconcile — check if enabled first
-    let reconcile_enabled = std::fs::read_to_string(opts.join("reconcile_enabled"))
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
-    if reconcile_enabled {
-        result.push(("reconcile".to_string(), read_reconcile_status(mount_point)));
-    } else {
-        result.push(("reconcile".to_string(), "off".into()));
-    }
+    result.push(("reconcile".to_string(), reconcile.summary()));
 
     // Only show background ops that actually have a sysfs toggle
     for prefix in ["rebalance", "copygc"] {
@@ -602,8 +991,18 @@ fn read_background(sysfs: &Path, mount_point: &str) -> Vec<(String, String)> {
             continue;
         }
 
+        if prefix == "copygc" {
+            let status = match copygc.running {
+                Some(true) => "working",
+                Some(false) => "idle",
+                None => "enabled (status unknown)",
+            };
+            result.push((prefix.into(), status.into()));
+            continue;
+        }
+
         // Try multiple status file names (varies by kernel version)
-        let status_names = [format!("{prefix}_status"), "copy_gc_wait".to_string()];
+        let status_names = [format!("{prefix}_status")];
         let mut status = String::new();
         for name in &status_names {
             let path = dir.join(name);
@@ -650,12 +1049,15 @@ fn parse_human_bytes(value: &str) -> Option<u64> {
         'M' => (&value[..value.len() - 1], 1024u64.pow(2)),
         'G' => (&value[..value.len() - 1], 1024u64.pow(3)),
         'T' => (&value[..value.len() - 1], 1024u64.pow(4)),
+        'P' => (&value[..value.len() - 1], 1024u64.pow(5)),
         _ => return None,
     };
     number
         .parse::<f64>()
         .ok()
-        .filter(|number| number.is_finite() && *number >= 0.0)
+        .filter(|number| {
+            number.is_finite() && *number >= 0.0 && *number * (multiplier as f64) < u64::MAX as f64
+        })
         .map(|number| (number * multiplier as f64) as u64)
 }
 
@@ -982,88 +1384,88 @@ fn bcachefs_fs_usage_space(mount_point: &str) -> (u64, u64) {
     (total, used)
 }
 
-/// Parse `bcachefs reconcile status <mount>` into a one-line summary.
-fn read_reconcile_status(mount_point: &str) -> String {
+/// Retain both data and metadata work; formatting belongs to the status view.
+fn read_reconcile_status(mount_point: &str) -> ReconcileStatus {
     let output = match std::process::Command::new("bcachefs")
         .args(["reconcile", "status", mount_point])
         .output()
     {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .filter(|l| !skip_bcachefs_warning(l))
             .collect::<Vec<_>>()
             .join("\n"),
-        Err(_) => return "n/a".into(),
+        _ => return ReconcileStatus::default(),
     };
+    parse_reconcile_status(&output)
+}
 
-    // Check scan pending
-    let scan_pending: u64 = output
-        .lines()
-        .find(|l| l.contains("Scan pending"))
-        .and_then(|l| l.split_whitespace().last())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    // Detect state from the output
-    let state = if output.contains("processing") {
-        "processing"
-    } else if output.contains("running") {
-        "running"
-    } else if output.contains("waiting") {
-        "idle"
-    } else {
-        "unrecognized"
-    };
-
-    // Extract progress percentage if processing
-    let progress = output
-        .lines()
-        .find(|l| l.contains('%'))
-        .and_then(|l| {
-            l.split('%')
-                .next()
-                .and_then(|s| s.split_whitespace().last())
-                .map(|s| format!(" {s}%"))
-        })
-        .unwrap_or_default();
-
-    // Collect non-zero pending categories
-    let mut pending_categories: Vec<String> = Vec::new();
+fn parse_reconcile_status(output: &str) -> ReconcileStatus {
+    let mut status = ReconcileStatus::default();
+    let mut columns = None;
     for line in output.lines() {
+        if skip_bcachefs_warning(line) {
+            continue;
+        }
         let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("Scan pending:") {
+            status.scan_pending = value.trim().parse().ok();
+        }
+        if trimmed.starts_with("processing ") || trimmed.starts_with("running") {
+            status.state = Some("working".into());
+        } else if trimmed.starts_with("waiting") || trimmed == "idle" {
+            status.state = Some("idle".into());
+        }
+        if let Some((prefix, _)) = trimmed.split_once('%')
+            && let Some(value) = prefix.split_whitespace().last()
+            && value
+                .parse::<f64>()
+                .is_ok_and(|n| n.is_finite() && (0.0..=100.0).contains(&n))
+        {
+            status.progress = Some(format!("{value}%"));
+        }
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() >= 2 && parts[0].ends_with(':') {
-            let name = parts[0].trim_end_matches(':');
-            if [
-                "replicas",
-                "checksum",
-                "erasure_code",
-                "compression",
-                "target",
-                "pending",
-                "stripes",
-            ]
-            .contains(&name)
-            {
-                let has_nonzero = parts[1..].iter().any(|v| *v != "0");
-                if has_nonzero {
-                    pending_categories.push(format!("{name}:{}", parts[1]));
-                }
-            }
+        if let (Some(data), Some(metadata)) = (
+            parts.iter().position(|s| *s == "data"),
+            parts.iter().position(|s| *s == "metadata"),
+        ) {
+            columns = Some((data + 1, metadata + 1));
+            continue;
+        }
+        let Some(name) = parts.first().and_then(|s| s.strip_suffix(':')) else {
+            continue;
+        };
+        if [
+            "replicas",
+            "checksum",
+            "erasure_code",
+            "compression",
+            "target",
+            "high_priority",
+            "pending",
+            "stripes",
+        ]
+        .contains(&name)
+        {
+            let (data_bytes, metadata_bytes) = columns.map_or((None, None), |(data, metadata)| {
+                (
+                    parts.get(data).and_then(|s| parse_human_bytes(s)),
+                    parts.get(metadata).and_then(|s| parse_human_bytes(s)),
+                )
+            });
+            status.work.push(ReconcileWork {
+                category: name.into(),
+                data_bytes,
+                metadata_bytes,
+            });
         }
     }
-
-    if state == "processing" {
-        if pending_categories.is_empty() {
-            format!("working{progress}")
-        } else {
-            format!("working{progress} — {}", pending_categories.join(" "))
-        }
-    } else if scan_pending > 0 || !pending_categories.is_empty() {
-        format!("idle — pending: {}", pending_categories.join(" "))
-    } else {
-        "idle".into()
+    // An output containing just the recognized table is still useful. An
+    // empty/failed/unknown command must not masquerade as a healthy idle FS.
+    if status.state.is_none() && (status.scan_pending.is_some() || !status.work.is_empty()) {
+        status.state = Some("status unknown".into());
     }
+    status
 }
 
 /// Per-process I/O snapshot from /proc/<pid>/io.

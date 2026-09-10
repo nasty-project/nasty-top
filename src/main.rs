@@ -2,6 +2,7 @@ mod advisor;
 mod app;
 mod metrics;
 mod sysfs;
+mod targets;
 mod theme;
 mod tuning;
 mod ui;
@@ -193,16 +194,27 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if app.show_counters {
                 app.show_processes = false;
                 app.show_blocked = false;
+                app.show_targets = false;
             }
             app.view_scroll = 0;
         }
         KeyCode::Char('r') => app.toggle_option("reconcile_enabled"),
+        KeyCode::Char('v') => {
+            app.show_targets = !app.show_targets;
+            if app.show_targets {
+                app.show_counters = false;
+                app.show_blocked = false;
+                app.show_processes = false;
+            }
+            app.view_scroll = 0;
+        }
         KeyCode::Char('g') => app.toggle_option("copygc_enabled"),
         KeyCode::Char('t') => {
             app.show_blocked = !app.show_blocked;
             if app.show_blocked {
                 app.show_processes = false;
                 app.show_counters = false;
+                app.show_targets = false;
             }
             app.view_scroll = 0;
         }
@@ -211,6 +223,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if app.show_processes {
                 app.show_blocked = false;
                 app.show_counters = false;
+                app.show_targets = false;
                 app.view_scroll = 0;
                 // Reset baseline so first tick shows rates.
                 app.prev_proc_io = sysfs::read_all_process_io();
@@ -222,7 +235,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Up | KeyCode::Char('k') => {
             if matches!(app.focus, app::Focus::Tuning) {
                 app.tuning.scroll_up();
-            } else if app.show_counters || app.show_blocked || app.show_processes {
+            } else if app.show_counters
+                || app.show_blocked
+                || app.show_processes
+                || app.show_targets
+            {
                 app.view_scroll = app.view_scroll.saturating_sub(1);
             } else {
                 app.scroll_devices_up();
@@ -231,7 +248,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Down | KeyCode::Char('j') => {
             if matches!(app.focus, app::Focus::Tuning) {
                 app.tuning.scroll_down();
-            } else if app.show_counters || app.show_blocked || app.show_processes {
+            } else if app.show_counters
+                || app.show_blocked
+                || app.show_processes
+                || app.show_targets
+            {
                 app.view_scroll += 1;
             } else {
                 app.scroll_devices_down();
