@@ -23,6 +23,8 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Process IO view** showing which processes are doing IO
 - **Journal fill %**, load average, reconcile progress
 - **Memory pressure context** with host RAM, available RAM, kernel-reclaimable memory, and the selected filesystem's btree-node cache
+- **Target capacity / GC pressure view** (`v`) with eligible members, raw capacity, free buckets, metadata footprint/backlog, and per-member allocation details
+- **Metadata placement diagnostics** for oversized footprints, insufficient replica members, and unequal-size replica-layout constraints; missing metrics remain explicitly unknown
 - **Session-aware error counts**: the device Err column dims pre-existing counts and turns bold red only when errors grow during the current run — so you can tell at a glance whether a number is dead history or actively climbing
 - **Consistent color scheme**: yellow = read, blue = write, red = errors/stalls
 
@@ -73,12 +75,13 @@ Options:
 | `c` | Toggle counters view |
 | `t` | Toggle blocked stats / time_stats view |
 | `p` | Toggle process IO view |
+| `v` | Toggle target capacity / GC pressure view |
 | `s` | Toggle pressure / filesystem device ordering |
 | `r` | Toggle reconcile on/off |
 | `g` | Toggle copygc on/off |
 | `f` | Cycle between filesystems |
 | `Tab` | Switch focus between metrics and options panel |
-| `↑`/`k`, `↓`/`j` | Scroll devices or the active detail view |
+| `↑`/`k`, `↓`/`j` | Scroll devices or the active detail view (including Targets) |
 | `Enter` | Edit selected option value (in options panel) |
 | `Esc` | Cancel edit / dismiss status message |
 | `N` | Mute current hint for 2 minutes |
@@ -99,12 +102,21 @@ Options:
 | Btree-node cache | `btree_cache_size` | Kernel-reported main buffers; approximate and not total bcachefs RAM |
 | Host memory | `/proc/meminfo` | Used, available, and kernel-reclaimable memory |
 | Reconcile | `bcachefs reconcile status` | Subprocess, parsed for progress |
+| Reconcile backlog | Same status output | Data and metadata columns retained separately |
+| Target membership / eligibility | `options/*_target`, `dev-N/{label,state,durability,data_allowed,block}` | Hierarchical labels or resolved device paths; non-writable/ineligible members excluded |
+| Member capacity / allocation | `dev-N/{nbuckets,bucket_size,alloc_debug}` | Member capacity, free buckets, btree and fragmented bytes; refreshed every 10s or on observed membership/state/options changes |
+| On-disk metadata footprint | `internal/alloc_debug` | Btree sectors converted to bytes; already includes physical replicas |
+| GC pressure | `internal/copy_gc_wait` | Running state and sign of each member's calculated wait; refreshed each tick |
 | Process IO | `/proc/<pid>/io` | read_bytes/write_bytes diffed |
 | Options | `options/*` | Read/write directly to sysfs |
 
 ## Tuning Hints
 
-When known bcachefs pressure signals fire (journal fill, blocked allocator, etc.), a hint appears in the footer with a short reason and an example sysfs command you *could* run. Nothing is applied automatically — the hint is informational. The current heuristics are unverified; treat them as a starting point for investigation, not a prescription. See [TUNING_RULES.md](TUNING_RULES.md) for the full rule set.
+When a target constraint or known bcachefs pressure signal fires, a hint appears in the footer. Press `v` for all target findings and the evidence behind them. Capacity/GC findings offer investigation guidance; older tuning hints may also include an example sysfs command. Nothing is applied automatically. Muting one hint reveals the next eligible hint; dismissals are scoped to the filesystem for the current run.
+
+For example, a metadata target with **2.82 TiB** of eligible member capacity and a reported **3.64 TiB** physical btree footprint is flagged, together with its metadata-placement backlog. The view also names members whose kernel GC-pressure signal is non-positive. It reports constraints rather than claiming to prove a reconcile deadlock.
+
+Raw capacity is an upper bound before reserves, journals and other data. Free buckets are not guaranteed allocatable space (cached/fragmented space is different). Targets are best-effort, may overlap, and data-target options are filesystem defaults, not a survey of per-file overrides. Unknown/unsupported sysfs formats display `?`; they do not imply zero capacity. See [TUNING_RULES.md](TUNING_RULES.md) for the rules and estimation limits.
 
 ## License
 

@@ -203,6 +203,11 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
 fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     let focus_style = focused_border(app, Focus::Metrics);
 
+    if app.show_targets {
+        draw_targets(f, app, area, focus_style);
+        return;
+    }
+
     let has_labels = app
         .rates
         .as_ref()
@@ -217,7 +222,7 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // Dynamic background height: compact when no stalls
-    let bg_count = app.current.background.len() as u16;
+    let bg_count = app.current.background.len() as u16 + u16::from(!app.target_reports.is_empty());
     let bg_height = if !app.stall_events.is_empty() {
         (bg_count + 3 + app.stall_events.len().min(5) as u16).min(14)
     } else {
@@ -1034,6 +1039,25 @@ fn draw_background(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
         })
         .collect();
 
+    let findings = app
+        .target_reports
+        .iter()
+        .map(|r| r.findings.len())
+        .sum::<usize>();
+    if !app.target_reports.is_empty() {
+        lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!("Targets: {findings} findings — [v] capacity / GC pressure"),
+                if findings > 0 {
+                    theme::bold(theme::ACCENT)
+                } else {
+                    theme::dim()
+                },
+            )),
+        );
+    }
+
     if has_stalls {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1055,6 +1079,97 @@ fn draw_background(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
 
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(para, area);
+}
+
+fn severity_color(severity: crate::targets::Severity) -> Color {
+    match severity {
+        crate::targets::Severity::Critical => theme::RED,
+        crate::targets::Severity::Warning => theme::ACCENT,
+    }
+}
+
+fn draw_targets(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
+    use crate::targets::format_optional_bytes as bytes;
+    let block = rounded_block_styled(
+        Span::styled("Targets / pressure [v]", theme::bold(theme::ACCENT)),
+        focus_style.fg.unwrap_or(theme::BORDER_DIM),
+    );
+    let mut lines = vec![
+        Line::from(
+            "Capacity is raw eligible-member space; free means free buckets, not guaranteed allocatable space.",
+        ),
+        Line::from(
+            "Targets are best-effort and may overlap. GC pressure is a kernel signal, not a diagnosis of a stuck worker.",
+        ),
+        Line::from(
+            "Allocator tables refresh every 10s; member state and GC signals refresh each tick. ? = unavailable.",
+        ),
+        Line::from(""),
+    ];
+    if app.target_reports.is_empty() {
+        lines.push(Line::from("Target options unavailable on this filesystem."));
+    }
+    for report in &app.target_reports {
+        lines.push(Line::from(Span::styled(
+            format!("{} → {}", report.role, report.target),
+            theme::bold(theme::FG),
+        )));
+        lines.push(Line::from(format!(
+            "  Eligible: {} / {} members   capacity: {}   free buckets: {}",
+            report
+                .eligible_members
+                .map_or("?".into(), |n| n.to_string()),
+            report.members.len(),
+            bytes(report.capacity_bytes),
+            bytes(report.free_bytes)
+        )));
+        for finding in &report.findings {
+            let label = match finding.severity {
+                crate::targets::Severity::Warning => "WARN",
+                crate::targets::Severity::Critical => "CRITICAL",
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {label}: {}", finding.summary),
+                theme::bold(severity_color(finding.severity)),
+            )));
+            lines.push(Line::from(format!("    {}", finding.detail)));
+        }
+        for note in &report.notes {
+            lines.push(Line::from(Span::styled(format!("  {note}"), theme::dim())));
+        }
+        for name in &report.members {
+            if let Some(device) = app.current.devices.iter().find(|d| &d.name == name) {
+                let a = &device.allocation;
+                lines.push(Line::from(format!(
+                    "    {} [{}{}] capacity {} / free {} / btree {} / fragmented {}{}",
+                    name,
+                    a.state.as_deref().unwrap_or("?"),
+                    match a.online {
+                        Some(true) => "",
+                        Some(false) => ", offline",
+                        None => ", online unknown",
+                    },
+                    bytes(a.capacity_bytes),
+                    bytes(a.free_bytes),
+                    bytes(a.btree_bytes),
+                    bytes(a.fragmented_bytes),
+                    if app.current.copygc.needs_gc.get(name) == Some(&true) {
+                        " — needs GC"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((app.view_scroll.min(u16::MAX as usize) as u16, 0)),
+        area,
+    );
 }
 
 fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -1158,6 +1273,10 @@ fn draw_help(f: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled("Toggles", theme::bold(theme::ACCENT))),
         Line::from(Span::styled(
+            "  v  target capacity / GC pressure",
+            Style::default().fg(theme::FG),
+        )),
+        Line::from(Span::styled(
             "  r  reconcile on/off",
             Style::default().fg(theme::FG),
         )),
@@ -1223,21 +1342,21 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ]));
         f.render_widget(para, area);
     } else if let Some(ref proposal) = app.proposal {
+        let color = severity_color(proposal.severity);
         let mut spans = vec![
             Span::styled(
                 " HINT ",
                 Style::default()
                     .fg(theme::BG)
-                    .bg(theme::ACCENT)
+                    .bg(color)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!(" {} ", proposal.reason),
-                Style::default().fg(theme::ACCENT),
-            ),
-            Span::styled(&proposal.command, theme::dim()),
-            Span::raw("  "),
+            Span::styled(format!(" {} ", proposal.reason), Style::default().fg(color)),
         ];
+        if let Some(command) = &proposal.command {
+            spans.push(Span::styled(command, theme::dim()));
+        }
+        spans.extend(key_hint("v", "targets"));
         spans.extend(key_hint("N", "mute 2min"));
         spans.extend(key_hint("!", "never"));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1248,6 +1367,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.extend(key_hint("c", "counters"));
         spans.extend(key_hint("t", "blocked"));
         spans.extend(key_hint("p", "procs"));
+        spans.extend(key_hint("v", "targets"));
         if area.width >= 100 {
             spans.extend(key_hint("s", "sort"));
         }
@@ -1628,6 +1748,59 @@ fn read_loadavg_parts() -> (String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targets_view_renders_metadata_capacity_and_unknown_metrics() {
+        let mut app = App::new(
+            vec![crate::sysfs::BcachefsFs {
+                uuid: "test".into(),
+                mount_point: "/".into(),
+                fs_name: "test".into(),
+                sysfs: "/nonexistent-nasty-top-test".into(),
+            }],
+            0,
+        );
+        app.show_targets = true;
+        app.target_reports = vec![crate::targets::TargetReport {
+            role: "metadata",
+            target: "ssd.nvme".into(),
+            members: vec![],
+            eligible_members: Some(3),
+            capacity_bytes: Some(2_953_869 << 20),
+            free_bytes: None,
+            findings: vec![crate::targets::Finding {
+                id: "metadata:ssd.nvme:capacity".into(),
+                severity: crate::targets::Severity::Warning,
+                summary: "Metadata footprint 3.64 TiB exceeds target capacity".into(),
+                detail: "Expand the metadata target.".into(),
+            }],
+            notes: vec!["Metadata target backlog: 1.16 TiB".into()],
+        }];
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "Targets / pressure",
+            "ssd.nvme",
+            "2.82 TiB",
+            "3.64 TiB",
+            "1.16 TiB",
+            "free buckets: ?",
+        ] {
+            assert!(content.contains(expected), "missing {expected}");
+        }
+        // Scrolling long reports and rendering in a small terminal must remain usable.
+        app.view_scroll = 3;
+        terminal.resize(Rect::new(0, 0, 40, 12)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
 
     #[test]
     fn counter_rate_uses_actual_sample_interval() {

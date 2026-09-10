@@ -28,11 +28,21 @@
             # cargoHash. cargoHash hashes the full `cargo vendor` tarball,
             # so any `cargo update` shifts it and downstream packagers
             # (#16, nasty's nasty.nix #362) discover this only when their
-            # build breaks. cargoLock.lockFile has Nix synthesize one
+            # build breaks. importCargoLock has Nix synthesize one
             # fetchurl per crate keyed on the SHA Cargo itself already
             # wrote into Cargo.lock — zero hash to maintain across
             # releases, no drift possible.
-            cargoLock.lockFile = ./Cargo.lock;
+            # Use Cargo's CDN directly: the API redirect returns HTTP 403 on
+            # CI runners. Override only fetching, preserving lockfile checksums
+            # and avoiding a duplicate crates-io source in the vendor config.
+            cargoDeps = (pkgs.rustPlatform.importCargoLock.override {
+              fetchurl = args: pkgs.fetchurl (args // {
+                url = pkgs.lib.replaceStrings
+                  [ "https://crates.io/api/v1/crates/" ]
+                  [ "https://static.crates.io/crates/" ]
+                  args.url;
+              });
+            }) { lockFile = ./Cargo.lock; };
             meta = {
               description = "A top-like TUI for bcachefs filesystems";
               homepage = "https://github.com/nasty-project/nasty-top";
