@@ -46,6 +46,8 @@ pub struct CopyGcStatus {
     /// The sign of the kernel's calculated wait, not a free-space quantity.
     /// Missing devices remain unknown, including on truncated sysfs output.
     pub needs_gc: HashMap<String, bool>,
+    /// Exact displayed kernel metric; its sign is used, not a free-byte value.
+    pub calculated_wait: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +113,8 @@ pub struct Finding {
     pub severity: Severity,
     pub summary: String,
     pub detail: String,
+    pub criteria: String,
+    pub evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +236,8 @@ pub fn analyze(snapshot: &FsSnapshot) -> Vec<TargetReport> {
                 severity: Severity::Critical,
                 summary: format!("{} target {} has no eligible writable members", config.role, config.target),
                 detail: "Check member state, labels, durability and data_allowed. Best-effort placement may spill outside the target.".into(),
+                criteria: format!("target membership known AND eligible_count == 0; eligible = online AND state=rw AND durability>0 AND data_allowed contains {data_type}"),
+                evidence: eligibility_evidence(&members, data_type),
             });
         }
         if config.role == "metadata" {
@@ -253,9 +259,43 @@ fn gc_findings(snapshot: &FsSnapshot, members: &[&DeviceInfo], report: &mut Targ
                     detail: format!("Kernel calculated wait is non-positive; copygc {}. Free buckets: {}; fragmented: {}. Inspect this member's allocator headroom; GC pressure can delay reconcile. This is not proof of a stalled worker.",
                         match snapshot.copygc.running { Some(true) => "is running", Some(false) => "is idle", None => "state unknown" },
                         format_optional_bytes(allocation.free_bytes), format_optional_bytes(allocation.fragmented_bytes)),
+                    criteria: "member belongs to this target AND kernel calculated copygc wait <= 0".into(),
+                    evidence: vec![format!("target={}, member={} (dev-{})", report.target, device.name, device.index),
+                        format!("internal/copy_gc_wait calculated wait = {} (kernel metric, not free bytes); needs_gc=true", snapshot.copygc.calculated_wait.get(&device.name).map_or("raw value unavailable", String::as_str)),
+                        format!("Context only: copygc.running={:?}, free buckets={}, fragmented={}", snapshot.copygc.running, format_optional_bytes(allocation.free_bytes), format_optional_bytes(allocation.fragmented_bytes))],
                 });
         }
     }
+}
+
+fn eligibility_evidence(members: &[&DeviceInfo], data_type: &str) -> Vec<String> {
+    let mut evidence = vec![format!(
+        "Resolved target members: {}; eligible_count={}",
+        members.len(),
+        members
+            .iter()
+            .filter(|d| d.allocation.eligible(data_type) == Some(true))
+            .count()
+    )];
+    evidence.extend(members.iter().map(|d| {
+        format!(
+            "{}: online={}, state={}, durability={}, data_allowed={} -> eligible({data_type})={}",
+            d.name,
+            option_text(d.allocation.online),
+            d.allocation.state.as_deref().unwrap_or("unknown"),
+            option_text(d.allocation.durability),
+            d.allocation
+                .data_allowed
+                .as_ref()
+                .map_or("unknown".into(), |types| types.join(",")),
+            option_text(d.allocation.eligible(data_type))
+        )
+    }));
+    evidence
+}
+
+fn option_text<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or("unknown".into(), |value| value.to_string())
 }
 
 fn metadata_findings(snapshot: &FsSnapshot, members: &[&DeviceInfo], report: &mut TargetReport) {
@@ -279,6 +319,12 @@ fn metadata_findings(snapshot: &FsSnapshot, members: &[&DeviceInfo], report: &mu
             severity: Severity::Critical,
             summary: format!("Metadata target {} has {} eligible members for {replicas} replicas", report.target, members.len()),
             detail: "All eligible members have durability=1. The requested copies need more distinct writable members in this target; check placement and membership.".into(),
+            criteria: "all eligible members have durability=1 AND 0 < eligible_count < metadata_replicas".into(),
+            evidence: {
+                let mut values = eligibility_evidence(members, "btree");
+                values.push(format!("eligible_count={} < metadata_replicas={replicas}", members.len()));
+                values
+            },
         });
     }
     let (Some(physical), Some(capacity)) = (physical, report.capacity_bytes) else {
@@ -293,6 +339,14 @@ fn metadata_findings(snapshot: &FsSnapshot, members: &[&DeviceInfo], report: &mu
             severity: Severity::Warning,
             summary: format!("Metadata target {}: footprint {} exceeds capacity {}", report.target, format_optional_bytes(Some(physical)), format_optional_bytes(Some(capacity))),
             detail: format!("Reported current physical metadata exceeds raw eligible capacity by {} before journals, reserves and other data. Expand/select a larger healthy SSD target. Replica changes or compaction can change the footprint; targets permit spillover.", format_optional_bytes(Some(physical - capacity))),
+            criteria: "P > C, where P = accounted physical btree sectors * 512 and C = SUM(raw capacity of eligible target members); P already includes replicas".into(),
+            evidence: {
+                let mut values = eligibility_evidence(members, "btree");
+                values.extend(members.iter().map(|d| format!("capacity({})={} bytes", d.name, d.allocation.capacity_bytes.unwrap())));
+                values.push(format!("P={physical} bytes > C={capacity} bytes; shortfall={} bytes", physical - capacity));
+                values.push(format!("Context only: metadata target backlog={}", format_optional_bytes(snapshot.reconcile.metadata_pending("target"))));
+                values
+            },
         });
     } else if let Some(replicas) = replicas
         && ordinary_durability
@@ -314,6 +368,14 @@ fn metadata_findings(snapshot: &FsSnapshot, members: &[&DeviceInfo], report: &mu
                 severity: Severity::Warning,
                 summary: format!("Metadata target {}: unequal member sizes may constrain {replicas} replicas", report.target),
                 detail: format!("Assuming a uniform {replicas}-copy layout, estimated logical metadata is {}. Capacity on distinct members cannot accommodate that layout, even though aggregate capacity fits. Verify replica accounting; this estimate excludes over-replication, failure domains and allocation reserves.", format_optional_bytes(Some(copy))),
+                criteria: "unit durability AND eligible_count >= r AND metadata replica backlog=0 AND P<=C AND SUM(min(member_capacity, ceil(P/r))) < P; assumes a uniform r-copy layout".into(),
+                evidence: {
+                    let mut values = eligibility_evidence(members, "btree");
+                    values.push(format!("P={physical} bytes, C={capacity} bytes, r={replicas}, L=ceil(P/r)={copy} bytes; replica backlog=0"));
+                    values.extend(members.iter().map(|d| format!("min(capacity({})={}, L={copy})={} bytes", d.name, d.allocation.capacity_bytes.unwrap(), d.allocation.capacity_bytes.unwrap().min(copy))));
+                    values.push(format!("Coverage={coverage} bytes < P={physical} bytes"));
+                    values
+                },
             });
         }
     }
@@ -324,6 +386,58 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn every_snapshot_rule_carries_its_equation_and_input_values() {
+        let mut examples = vec![
+            pool(&[200, 200, 200], 900),
+            pool(&[200, 200], 100),
+            pool(&[500, 80, 80], 300),
+        ];
+        let mut no_members = pool(&[200, 200, 200], 300);
+        for device in &mut no_members.devices {
+            device.allocation.state = Some("ro".into());
+        }
+        examples.push(no_members);
+        let mut gc = pool(&[200, 200, 200], 300);
+        gc.copygc.needs_gc.insert("nvme0n1p3".into(), true);
+        gc.copygc
+            .calculated_wait
+            .insert("nvme0n1p3".into(), "-292M".into());
+        let gc_report = analyze(&gc).remove(0);
+        assert!(
+            gc_report.findings[0]
+                .evidence
+                .iter()
+                .any(|s| s.contains("-292M"))
+        );
+        examples.push(gc);
+        let mut rules = std::collections::HashSet::new();
+        for example in examples {
+            for report in analyze(&example) {
+                for finding in report.findings {
+                    assert!(
+                        !finding.criteria.is_empty(),
+                        "{} has no criteria",
+                        finding.id
+                    );
+                    assert!(!finding.evidence.is_empty(), "{} has no inputs", finding.id);
+                    rules.insert(if finding.id.contains(":gc:") {
+                        "gc".into()
+                    } else {
+                        finding.id.rsplit(':').next().unwrap().to_string()
+                    });
+                }
+            }
+        }
+        assert_eq!(
+            rules,
+            ["capacity", "replicas", "layout", "no-members", "gc"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
 
     fn pool(capacities: &[u64], physical_gib: u64) -> FsSnapshot {
         FsSnapshot {

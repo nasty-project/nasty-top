@@ -62,6 +62,10 @@ pub struct App {
     pub stall_events: Vec<StallEvent>,
     /// Current advisor hint (informational only).
     pub proposal: Option<crate::advisor::Proposal>,
+    /// Frozen copy of the selected hint, so its explanation cannot change
+    /// underneath the user when a new tick selects a different proposal.
+    pub inspected_hint: Option<crate::advisor::Proposal>,
+    pub hint_scroll: usize,
     /// When the current hint first appeared — used to enforce a minimum
     /// display time so triggers that fire for a single tick stay visible
     /// long enough to read.
@@ -136,6 +140,8 @@ impl App {
             process_rates: Vec::new(),
             stall_events: Vec::new(),
             proposal: None,
+            inspected_hint: None,
+            hint_scroll: 0,
             proposal_first_shown: None,
             blocked_deltas: Vec::new(),
             counter_deltas: Vec::new(),
@@ -466,6 +472,16 @@ impl App {
         }
     }
 
+    pub fn explain_hint(&mut self) {
+        self.show_help = false;
+        if let Some(proposal) = &self.proposal {
+            self.inspected_hint = Some(proposal.clone());
+            self.hint_scroll = 0;
+        } else {
+            self.set_status("No current hint to explain; press a for recent Advisor findings");
+        }
+    }
+
     pub fn toggle_focus(&mut self) {
         self.focus = toggled_focus(self.show_options, self.focus);
     }
@@ -565,6 +581,8 @@ impl App {
         self.device_scroll = 0;
         self.proposal = None;
         self.proposal_first_shown = None;
+        self.inspected_hint = None;
+        self.hint_scroll = 0;
         self.set_status(format!(
             "Switched to: {} ({}/{})",
             self.fs.fs_name,

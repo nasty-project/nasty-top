@@ -1,0 +1,8 @@
+IO errors since filesystem creation
+  read:    0
+  write:   0
+  checksum:2
+IO errors since 8 y ago
+  read:    0
+  write:   0
+  checksum:2

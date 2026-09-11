@@ -7,10 +7,16 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub const PEER_AFTER: Duration = Duration::from_secs(30);
+pub const PEER_MIN_SAMPLES: usize = 3;
 const BASELINE_WINDOW: Duration = Duration::from_secs(300);
 pub const HEADROOM_WINDOW: Duration = Duration::from_secs(600);
 pub const HEADROOM_MIN: Duration = Duration::from_secs(120);
 pub const ALLOC_INTERVAL: Duration = Duration::from_secs(10);
+const MIN_LOSS_BYTES: u64 = 64 << 20;
+const MIN_LOSS_DIVISOR: u64 = 10;
+const MIN_DECREASES: usize = 3;
+const DIRECTION_PERCENT: usize = 70;
+const PRESSURE_PERCENT: usize = 80;
 
 struct BaselinePoint {
     start: Instant,
@@ -68,7 +74,7 @@ impl LatencyHistory {
         if sample.outlier {
             let since = *self.since.get_or_insert(at);
             self.samples = self.samples.saturating_add(1);
-            if at.duration_since(since) < PEER_AFTER || self.samples < 3 {
+            if at.duration_since(since) < PEER_AFTER || self.samples < PEER_MIN_SAMPLES {
                 return None;
             }
             let baseline_ms = self
@@ -133,6 +139,61 @@ pub struct HeadroomSummary {
     pub first_backlog: Option<u64>,
     pub last_backlog: Option<u64>,
     pub alert: bool,
+    pub decreases: usize,
+    pub increases: usize,
+    pub recent_reference: Option<(u64, Duration)>,
+}
+
+impl HeadroomSummary {
+    pub fn criteria(&self) -> String {
+        format!(
+            "valid unchanged-policy/member history AND coverage >= {}s AND loss >= max({MIN_LOSS_BYTES} bytes, first_free/{MIN_LOSS_DIVISOR}) AND decreases >= {MIN_DECREASES} AND 100*decreases >= {DIRECTION_PERCENT}*(decreases+increases) AND latest_free < reference_free at least {}s earlier AND 100*pressure_samples >= {PRESSURE_PERCENT}*samples",
+            HEADROOM_MIN.as_secs(),
+            PEER_AFTER.as_secs()
+        )
+    }
+    pub fn indicators(&self) -> Vec<String> {
+        vec![
+            format!(
+                "coverage={:.3}s >= {}s; fresh samples={}",
+                self.seconds,
+                HEADROOM_MIN.as_secs(),
+                self.samples
+            ),
+            format!(
+                "first_free={} bytes; latest_free={} bytes; loss={} bytes >= max({MIN_LOSS_BYTES}, {}/{MIN_LOSS_DIVISOR})={} bytes",
+                self.first_free,
+                self.last_free,
+                self.first_free.saturating_sub(self.last_free),
+                self.first_free,
+                MIN_LOSS_BYTES.max(self.first_free / MIN_LOSS_DIVISOR)
+            ),
+            format!(
+                "decreases={} >= {MIN_DECREASES}; increases={}; 100*{}={} >= {DIRECTION_PERCENT}*{}={}",
+                self.decreases,
+                self.increases,
+                self.decreases,
+                100 * self.decreases,
+                self.decreases + self.increases,
+                DIRECTION_PERCENT * (self.decreases + self.increases)
+            ),
+            self.recent_reference
+                .map_or("recent reference: unknown".into(), |(free, age)| {
+                    format!(
+                        "latest_free={} < reference_free={free} bytes; reference age={:.3}s >= {}s",
+                        self.last_free,
+                        age.as_secs_f64(),
+                        PEER_AFTER.as_secs()
+                    )
+                }),
+            format!(
+                "100*pressure_samples={} >= {PRESSURE_PERCENT}*samples={}; unknown pressure samples={} (included in denominator)",
+                100 * self.pressure_samples,
+                PRESSURE_PERCENT * self.samples,
+                self.unknown_pressure
+            ),
+        ]
+    }
 }
 
 #[derive(Default)]
@@ -192,9 +253,9 @@ impl HeadroomHistory {
             "warming up"
         } else if last.free == first.free {
             "steady"
-        } else if last.free < first.free && down * 10 >= (down + up) * 7 {
+        } else if last.free < first.free && down * 100 >= (down + up) * DIRECTION_PERCENT {
             "falling"
-        } else if last.free > first.free && up * 10 >= (down + up) * 7 {
+        } else if last.free > first.free && up * 100 >= (down + up) * DIRECTION_PERCENT {
             "rising"
         } else {
             "fluctuating"
@@ -204,18 +265,18 @@ impl HeadroomHistory {
             .iter()
             .filter(|p| p.pressure == Some(true))
             .count();
-        let recent_decline = self
+        let recent_reference = self
             .points
             .iter()
             .rev()
             .find(|p| last.at.duration_since(p.at) >= PEER_AFTER)
-            .is_some_and(|p| last.free < p.free);
-        let threshold = (64u64 << 20).max(first.free / 10);
+            .map(|p| (p.free, last.at.duration_since(p.at)));
+        let threshold = MIN_LOSS_BYTES.max(first.free / MIN_LOSS_DIVISOR);
         let alert = direction == "falling"
-            && down >= 3
-            && recent_decline
+            && down >= MIN_DECREASES
+            && recent_reference.is_some_and(|(free, _)| last.free < free)
             && first.free.saturating_sub(last.free) >= threshold
-            && pressure_samples * 5 >= self.points.len() * 4;
+            && pressure_samples * 100 >= self.points.len() * PRESSURE_PERCENT;
         HeadroomSummary {
             direction,
             seconds,
@@ -233,6 +294,9 @@ impl HeadroomHistory {
             first_backlog: first.backlog,
             last_backlog: last.backlog,
             alert,
+            decreases: down,
+            increases: up,
+            recent_reference,
         }
     }
 }
@@ -315,6 +379,8 @@ mod tests {
             median_queue: 0.5,
             peers: vec!["a".into(), "b".into()],
             outlier,
+            floor_ms: 2.0,
+            selection_evidence: Vec::new(),
         }
     }
     fn point(at: Instant, free: u64, pressure: Option<bool>) -> HeadroomPoint {

@@ -4,12 +4,16 @@ use crate::app::App;
 use crate::diagnostics::Status;
 use crate::targets::Severity;
 
+const RECENT_WRITE_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct Proposal {
     pub reason: String,
     pub id: String,
     pub severity: Severity,
     pub detail: String,
+    pub criteria: String,
+    pub evidence: Vec<String>,
     pub command: Option<String>,
 }
 
@@ -24,6 +28,8 @@ pub fn evaluate(app: &App) -> Option<Proposal> {
             reason: d.summary.clone(),
             severity: d.severity,
             detail: d.action.clone(),
+            criteria: d.criteria.clone(),
+            evidence: d.evidence.clone(),
             command: None,
         })
         .collect();
@@ -34,6 +40,7 @@ pub fn evaluate(app: &App) -> Option<Proposal> {
 /// These are snapshot observations, not claims of sustained activity. Retain
 /// all of them in the Advisor view, including muted footer hints.
 pub fn snapshot_proposals(app: &App) -> Vec<Proposal> {
+    let observed_at = std::time::Instant::now();
     let mut proposals: Vec<_> = app
         .target_reports
         .iter()
@@ -43,6 +50,8 @@ pub fn snapshot_proposals(app: &App) -> Vec<Proposal> {
             reason: f.summary.clone(),
             severity: f.severity,
             detail: f.detail.clone(),
+            criteria: f.criteria.clone(),
+            evidence: f.evidence.clone(),
             command: None,
         })
         .collect();
@@ -51,15 +60,31 @@ pub fn snapshot_proposals(app: &App) -> Vec<Proposal> {
         .options
         .get("copygc_enabled")
         .is_some_and(|v| v == "1");
-    let has_write_stalls = app
+    let recent_write_stalls: Vec<_> = app
         .stall_events
         .iter()
-        .any(|e| e.direction == "write" && e.time.elapsed().as_secs() < 60);
-    if copygc_stall_pressure(copygc_on, has_write_stalls, &app.current.background) {
+        .filter_map(|e| {
+            let age = observed_at.checked_duration_since(e.time)?;
+            (e.direction == "write" && age < RECENT_WRITE_STALL_WINDOW).then_some((e, age))
+        })
+        .collect();
+    if copygc_stall_pressure(
+        copygc_on,
+        !recent_write_stalls.is_empty(),
+        &app.current.background,
+    ) {
         proposals.push(Proposal {
             id: "copygc-pressure".into(), severity: Severity::Warning,
             reason: "Write stalls coincide with copygc — inspect member headroom in Targets [v]".into(),
             detail: "Recent write stalls and current copygc activity coincide. Inspect target headroom; this does not prove that GC caused the stalls or that disabling it would help.".into(),
+            criteria: format!("copygc_enabled=1 AND copygc state starts with 'working' AND count(write-direction stall events younger than {}s)>0", RECENT_WRITE_STALL_WINDOW.as_secs()),
+            evidence: {
+                let mut values = vec![format!("copygc_enabled={}; state={}; recent write-direction events={}",
+                    app.current.options.get("copygc_enabled").unwrap(),
+                    app.current.background.iter().find(|(n, _)| n == "copygc").map_or("unknown", |(_, state)| state), recent_write_stalls.len())];
+                values.extend(recent_write_stalls.iter().map(|(e, age)| format!("Event age {:.6}s < {}s, {}: {}", age.as_secs_f64(), RECENT_WRITE_STALL_WINDOW.as_secs(), e.device, e.detail)));
+                values
+            },
             command: None,
         });
     }
@@ -98,6 +123,8 @@ mod tests {
                 severity: Severity::Critical,
                 reason: "capacity".into(),
                 detail: String::new(),
+                criteria: "test criterion".into(),
+                evidence: vec!["test input".into()],
                 command: None,
             },
             Proposal {
@@ -105,6 +132,8 @@ mod tests {
                 severity: Severity::Warning,
                 reason: "pressure".into(),
                 detail: String::new(),
+                criteria: "test criterion".into(),
+                evidence: vec!["test input".into()],
                 command: None,
             },
         ];
@@ -138,6 +167,13 @@ mod tests {
         assert_eq!(proposal.id, "copygc-pressure");
         assert!(proposal.command.is_none());
         assert!(proposal.reason.contains("coincide"));
+        assert!(proposal.criteria.contains("copygc_enabled=1"));
+        assert!(
+            proposal
+                .evidence
+                .iter()
+                .any(|s| s.contains("recent write-direction events=1"))
+        );
         app.proposal = Some(proposal);
         app.dismiss_permanent();
         assert!(app.is_dismissed("copygc-pressure"));
