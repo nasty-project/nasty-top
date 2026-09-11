@@ -27,11 +27,17 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
 
+      - name: Release metadata tests
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_*.py'
+
       - name: Tests
         run: cargo test --locked
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Verify crates.io package
+        run: cargo package --locked
 
   nix:
     name: Nix package

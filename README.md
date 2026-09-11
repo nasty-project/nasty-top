@@ -4,9 +4,9 @@ A top-like TUI for bcachefs filesystems. Real-time per-device IO, latency, and i
 
 Built for [NASty](https://github.com/nasty-project/nasty) but works on any system with a mounted bcachefs filesystem.
 
-![nasty-top device IO](screen1.jpg)
-![nasty-top process IO](screen2.jpg)
-![nasty-top counters](screen3.jpg)
+![nasty-top device IO](https://raw.githubusercontent.com/nasty-project/nasty-top/master/screen1.jpg)
+![nasty-top process IO](https://raw.githubusercontent.com/nasty-project/nasty-top/master/screen2.jpg)
+![nasty-top counters](https://raw.githubusercontent.com/nasty-project/nasty-top/master/screen3.jpg)
 
 ## Features
 
@@ -36,6 +36,27 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Consistent color scheme**: yellow = read, blue = write, red = errors/stalls
 
 ## Install
+
+### Requirements
+
+- **Runtime:** Linux with a mounted bcachefs filesystem and readable `/proc` and `/sys` interfaces. nasty-top can be built on macOS for development, but monitoring requires Linux.
+- **bcachefs tools:** install your distribution's `bcachefs-tools` package so the `bcachefs` command is on `PATH`. It supplies reconcile status and the filesystem-usage fallback. Available metrics depend on the running bcachefs module's interfaces.
+- **Permissions:** metric availability depends on the user's access to sysfs and process information. Editing runtime options requires permission to write the corresponding sysfs files, usually root.
+- **Source installation:** Rust/Cargo **1.88 or newer** and a C linker/toolchain. On Debian/Ubuntu, the linker/toolchain is provided by `build-essential`; on Arch Linux, by `base-devel`. Prebuilt downloads do not require Rust.
+
+### From crates.io
+
+```bash
+cargo install nasty-top --locked
+```
+
+This builds the binary from source and installs it into Cargo's binary directory, normally `~/.cargo/bin`. Ensure that directory is on `PATH`. To install this specific release:
+
+```bash
+cargo install nasty-top --version 0.0.11 --locked
+```
+
+### Other installation methods
 
 **Nix:**
 ```bash
@@ -129,7 +150,7 @@ The `!` marker includes immediate comparable-peer latency deviations and direct 
 
 Press **`a`** for the peer group, read/write comparisons, supporting AQ measurements and sustained findings. Comparisons keep rotational devices, NVMe and other non-rotational devices separate. At least two peers with non-overlapping kernel-visible backing devices must be active in the same direction with broadly similar queue depth, request rate and read/write mix. Unknown/mixed backing graphs, insufficient peers and idle samples are explicitly unavailable. Earlier comparable non-outlier samples provide an optional request-weighted device baseline.
 
-Press **`v`** for per-target headroom history and member backing-device information. Trends use fresh allocator samples, not repeated reads of cached values. They show observed free-bucket changes, sampled GC pressure, and metadata/background placement backlog where applicable. Falling-headroom warnings require at least two minutes of evidence, a material ongoing decline, and GC pressure in at least 80% of samples. Policy/membership changes and missing or stale measurements restart the history. These are measured trends, not time-until-full forecasts; see [TUNING_RULES.md](TUNING_RULES.md) for thresholds and limits.
+Press **`v`** for per-target headroom history and member backing-device information. Trends use fresh allocator samples, not repeated reads of cached values. They show observed free-bucket changes, sampled GC pressure, and metadata/background placement backlog where applicable. Falling-headroom warnings require at least two minutes of evidence, a material ongoing decline, and GC pressure in at least 80% of samples. Policy/membership changes and missing or stale measurements restart the history. These are measured trends, not time-until-full forecasts; see [TUNING_RULES.md](https://github.com/nasty-project/nasty-top/blob/master/TUNING_RULES.md) for thresholds and limits.
 
 ### Metric sources
 
@@ -181,7 +202,24 @@ The advisor uses up to 60 seconds of valid, timestamped evidence. Missing sample
 
 For example, a metadata target with **2.82 TiB** of eligible member capacity and a reported **3.64 TiB** physical btree footprint is flagged, together with its metadata-placement backlog. The view also names members whose kernel GC-pressure signal is non-positive. It reports constraints rather than claiming to prove a reconcile deadlock.
 
-Raw capacity is an upper bound before reserves, journals and other data. Free buckets are not guaranteed allocatable space (cached/fragmented space is different). Targets are best-effort, may overlap, and data-target options are filesystem defaults, not a survey of per-file overrides. Unknown/unsupported sysfs formats display `?`; they do not imply zero capacity. See [TUNING_RULES.md](TUNING_RULES.md) for the rules and estimation limits.
+Raw capacity is an upper bound before reserves, journals and other data. Free buckets are not guaranteed allocatable space (cached/fragmented space is different). Targets are best-effort, may overlap, and data-target options are filesystem defaults, not a survey of per-file overrides. Unknown/unsupported sysfs formats display `?`; they do not imply zero capacity. See [TUNING_RULES.md](https://github.com/nasty-project/nasty-top/blob/master/TUNING_RULES.md) for the rules and estimation limits.
+
+## Publishing releases (maintainers)
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`. The workflow first checks that the tag, `Cargo.toml`, and the root package in `Cargo.lock` have matching versions. It then builds the Linux binaries, creates the GitHub release, and publishes the source crate to crates.io. Already-published crate versions are skipped on reruns; registry errors fail the check rather than being treated as an unpublished version.
+
+### One-time crates.io setup
+
+Version `0.0.11` was published manually. To enable automated publishing of subsequent versions, a crate owner must open [nasty-top settings](https://crates.io/crates/nasty-top/settings), select **Trusted Publishing**, and add a GitHub publisher with:
+
+- **Repository owner:** `nasty-project`
+- **Repository name:** `nasty-top`
+- **Workflow filename:** `release.yml`
+- **Environment:** leave empty (the publishing job does not declare an environment)
+
+The job uses `rust-lang/crates-io-auth-action@v1` and GitHub OIDC to obtain a short-lived publishing token. A long-lived crates.io API token does not need to be stored in GitHub secrets. Automated publication will only work after the publisher is configured on crates.io and this workflow is included in the tagged commit.
+
+For each subsequent release, update both Cargo version entries, commit the changes, and push the matching tag. CI runs release-metadata tests and verifies that the packaged crate builds before changes are merged.
 
 ## License
 
