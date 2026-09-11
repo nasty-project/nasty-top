@@ -52,6 +52,9 @@ pub struct App {
     pub show_processes: bool,
     pub show_blocked: bool,
     pub show_targets: bool,
+    pub show_advisor: bool,
+    pub diagnostics: crate::diagnostics::Diagnostics,
+    pub expected_interval: std::time::Duration,
     pub target_reports: Vec<crate::targets::TargetReport>,
     pub prev_proc_io: Vec<ProcessIo>,
     pub process_rates: Vec<ProcessRate>,
@@ -97,10 +100,14 @@ impl App {
         let snap = sysfs::snapshot(&fs);
         let tuning = TuningState::new(&snap.options);
         let target_reports = crate::targets::analyze(&snap);
+        let expected_interval = std::time::Duration::from_secs(2);
+        let mut diagnostics = crate::diagnostics::Diagnostics::default();
+        diagnostics.update(&fs.uuid, &snap, Instant::now(), expected_interval);
         let initial_errors = snap
             .devices
             .iter()
-            .map(|d| (d.name.clone(), d.io_errors))
+            .filter(|d| d.error_counts.is_some())
+            .map(|d| (d.identity(), d.io_errors))
             .collect();
         Self {
             fs,
@@ -121,6 +128,9 @@ impl App {
             show_processes: false,
             show_blocked: false,
             show_targets: false,
+            show_advisor: false,
+            diagnostics,
+            expected_interval,
             target_reports,
             prev_proc_io: sysfs::read_all_process_io(),
             process_rates: Vec::new(),
@@ -155,10 +165,19 @@ impl App {
         // Baseline error counts for any newly-appearing devices so we
         // don't flag pre-existing errors on a device added mid-session.
         for d in &new_snap.devices {
-            self.initial_errors
-                .entry(d.name.clone())
-                .or_insert(d.io_errors);
+            if d.error_counts.is_none() {
+                continue;
+            }
+            let key = d.identity();
+            if self.current.devices.iter().any(|old| {
+                old.identity() == key && old.error_counts.is_some() && old.io_errors > d.io_errors
+            }) {
+                self.initial_errors.insert(key.clone(), d.io_errors);
+            }
+            self.initial_errors.entry(key).or_insert(d.io_errors);
         }
+        self.initial_errors
+            .retain(|key, _| new_snap.devices.iter().any(|d| d.identity() == *key));
 
         // Compute rates from previous snapshot
         let rates = metrics::compute_rates(&self.current, &new_snap, dt);
@@ -267,14 +286,21 @@ impl App {
             } else {
                 0.0
             };
-            if curr_dirty > prev_dirty + 1000 && curr_pct > 70.0 {
+            if self.current.journal.entries.is_some()
+                && new_snap.journal.entries.is_some()
+                && curr_dirty > prev_dirty + 1000
+                && curr_pct > 70.0
+            {
                 self.stall_events.insert(
                     0,
                     StallEvent {
                         time: now,
                         device: "journal".into(),
                         direction: "write",
-                        detail: format!("filling rapidly: {:.0}%", curr_pct),
+                        detail: format!(
+                            "dirty-entry occupancy rising rapidly: {:.0}% (not disk space)",
+                            curr_pct
+                        ),
                     },
                 );
             }
@@ -373,6 +399,12 @@ impl App {
 
         self.previous = Some(std::mem::replace(&mut self.current, new_snap));
         self.target_reports = crate::targets::analyze(&self.current);
+        self.diagnostics.update(
+            &self.fs.uuid,
+            &self.current,
+            Instant::now(),
+            self.expected_interval,
+        );
         self.rates = Some(rates);
         self.device_scroll = self.device_scroll.min(
             self.rates
@@ -402,6 +434,12 @@ impl App {
                 if elapsed >= MIN_HINT_DISPLAY {
                     self.proposal = None;
                     self.proposal_first_shown = None;
+                } else if let Some(proposal) = &mut self.proposal {
+                    if let Some(finding) = self.diagnostics.findings.get(&proposal.id) {
+                        proposal.reason = format!("{:?}: {}", finding.status, finding.summary);
+                    } else if !proposal.reason.starts_with("Last observed: ") {
+                        proposal.reason = format!("Last observed: {}", proposal.reason);
+                    }
                 }
             }
             (None, None) => {}
@@ -498,10 +536,18 @@ impl App {
         self.initial_errors = snap
             .devices
             .iter()
-            .map(|d| (d.name.clone(), d.io_errors))
+            .filter(|d| d.error_counts.is_some())
+            .map(|d| (d.identity(), d.io_errors))
             .collect();
         self.current = snap;
         self.target_reports = crate::targets::analyze(&self.current);
+        self.diagnostics = crate::diagnostics::Diagnostics::default();
+        self.diagnostics.update(
+            &self.fs.uuid,
+            &self.current,
+            Instant::now(),
+            self.expected_interval,
+        );
         self.previous = None;
         self.rates = None;
         self.last_tick = Instant::now();

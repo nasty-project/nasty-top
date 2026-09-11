@@ -203,6 +203,10 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
 fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     let focus_style = focused_border(app, Focus::Metrics);
 
+    if app.show_advisor {
+        draw_advisor(f, app, area, focus_style);
+        return;
+    }
     if app.show_targets {
         draw_targets(f, app, area, focus_style);
         return;
@@ -222,7 +226,8 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // Dynamic background height: compact when no stalls
-    let bg_count = app.current.background.len() as u16 + u16::from(!app.target_reports.is_empty());
+    let bg_count =
+        app.current.background.len() as u16 + u16::from(!app.target_reports.is_empty()) + 1;
     let bg_height = if !app.stall_events.is_empty() {
         (bg_count + 3 + app.stall_events.len().min(5) as u16).min(14)
     } else {
@@ -413,7 +418,14 @@ fn draw_system_panel(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
     f.render_widget(Paragraph::new(cache_line), rows[4]);
 
     render_gauge(f, rows[6], " IOw", app.iowait_pct, theme::dim());
-    render_gauge(f, rows[7], " Jnl", jpct, theme::dim());
+    if app.current.journal.entries.is_some() {
+        render_gauge(f, rows[7], "JEnt", jpct, theme::dim());
+    } else {
+        f.render_widget(
+            Paragraph::new(Span::styled(" JEnt ?", theme::dim())),
+            rows[7],
+        );
+    }
     render_gauge(f, rows[8], " Dsk", space_pct, theme::dim());
 }
 
@@ -552,6 +564,7 @@ fn draw_device_table(
     let mut sr = [0.0_f64; 5];
     let mut sw = [0.0_f64; 5];
     let mut sum_errs = 0u64;
+    let mut errors_known = true;
     let mut sum_new_errs = 0u64;
     let mut sum_queue = 0u64;
     let mut sum_avg_queue = 0.0_f64;
@@ -572,6 +585,7 @@ fn draw_device_table(
         read_active: bool,
         write_active: bool,
         errors: u64,
+        errors_valid: bool,
         new_errors: u64,
         util_pct: f64,
         queue_depth: u64,
@@ -603,6 +617,7 @@ fn draw_device_table(
             sr[4] += d.read_bytes_sec;
             sw[4] += d.write_bytes_sec;
             sum_errs += d.io_errors;
+            errors_known &= d.errors_valid;
             sum_queue += d.queue_depth;
             sum_avg_queue += d.avg_queue_depth;
             sum_read_wait += d.read_await_ms * d.read_iops;
@@ -611,7 +626,7 @@ fn draw_device_table(
             sum_write_iops += d.write_iops;
             let baseline = app
                 .initial_errors
-                .get(&d.name)
+                .get(&d.member_key)
                 .copied()
                 .unwrap_or(d.io_errors);
             let new_errors = d.io_errors.saturating_sub(baseline);
@@ -628,6 +643,7 @@ fn draw_device_table(
                 read_active: d.read_active,
                 write_active: d.write_active,
                 errors: d.io_errors,
+                errors_valid: d.errors_valid,
                 new_errors,
                 util_pct: d.util_pct,
                 queue_depth: d.queue_depth,
@@ -760,7 +776,12 @@ fn draw_device_table(
                     Row::new(vec![
                         Cell::new(device_name).style(device_style),
                         Cell::new(d.label.clone().unwrap_or_default()).style(theme::dim()),
-                        Cell::new(format!("{}", d.errors)).style(es),
+                        Cell::new(if d.errors_valid {
+                            d.errors.to_string()
+                        } else {
+                            "?".into()
+                        })
+                        .style(es),
                         util_cell,
                         Cell::new(queue).style(Style::default().fg(queue_color)),
                         Cell::new(avg_queue).style(Style::default().fg(queue_color)),
@@ -769,7 +790,12 @@ fn draw_device_table(
                 } else {
                     Row::new(vec![
                         Cell::new(device_name).style(device_style),
-                        Cell::new(format!("{}", d.errors)).style(es),
+                        Cell::new(if d.errors_valid {
+                            d.errors.to_string()
+                        } else {
+                            "?".into()
+                        })
+                        .style(es),
                         util_cell,
                         Cell::new(queue).style(Style::default().fg(queue_color)),
                         Cell::new(avg_queue).style(Style::default().fg(queue_color)),
@@ -790,7 +816,12 @@ fn draw_device_table(
             rows.push(Row::new(vec![
                 Cell::new("TOTAL").style(total_style),
                 Cell::new(""),
-                Cell::new(format!("{}", sum_errs)).style(total_err_style),
+                Cell::new(if errors_known {
+                    sum_errs.to_string()
+                } else {
+                    "?".into()
+                })
+                .style(total_err_style),
                 Cell::new(""),
                 Cell::new(sum_queue.to_string()),
                 Cell::new(format!("{sum_avg_queue:.1}")),
@@ -798,7 +829,12 @@ fn draw_device_table(
         } else {
             rows.push(Row::new(vec![
                 Cell::new("TOTAL").style(total_style),
-                Cell::new(format!("{}", sum_errs)).style(total_err_style),
+                Cell::new(if errors_known {
+                    sum_errs.to_string()
+                } else {
+                    "?".into()
+                })
+                .style(total_err_style),
                 Cell::new(""),
                 Cell::new(sum_queue.to_string()),
                 Cell::new(format!("{sum_avg_queue:.1}")),
@@ -1058,6 +1094,27 @@ fn draw_background(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
         );
     }
 
+    let active = app
+        .diagnostics
+        .findings
+        .values()
+        .filter(|d| d.status == crate::diagnostics::Status::Active)
+        .count();
+    lines.insert(
+        0,
+        Line::from(Span::styled(
+            format!(
+                "Advisor: {active} active / {} recent — [a] evidence",
+                app.diagnostics.findings.len() - active
+            ),
+            if active > 0 {
+                theme::bold(theme::ACCENT)
+            } else {
+                theme::dim()
+            },
+        )),
+    );
+
     if has_stalls {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1172,6 +1229,98 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
     );
 }
 
+fn draw_advisor(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
+    use crate::diagnostics::{Confidence, Status};
+    let now = std::time::Instant::now();
+    let mut lines = vec![
+        Line::from(
+            "Evidence covers up to 60s of valid samples; no-completion detection requires 30s and multiple observations.",
+        ),
+        Line::from(
+            "Missing data and collection gaps suspend conclusions. Snapshot target constraints are listed separately below.",
+        ),
+        Line::from(""),
+    ];
+    let mut findings: Vec<_> = app.diagnostics.findings.values().collect();
+    findings.sort_by_key(|d| {
+        (
+            d.status != Status::Active,
+            std::cmp::Reverse(d.severity),
+            &d.id,
+        )
+    });
+    if findings.is_empty() {
+        lines.push(Line::from(
+            "No windowed findings. Collecting evidence where metrics are available.",
+        ));
+    }
+    for d in findings {
+        let style = if d.status == Status::Active {
+            theme::bold(severity_color(d.severity))
+        } else {
+            theme::dim()
+        };
+        let confidence = match d.confidence {
+            Confidence::Observed => "observed",
+            Confidence::PossibleCause => "possible cause",
+        };
+        let muted = if app.is_dismissed(&d.id) {
+            " / footer muted"
+        } else {
+            ""
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{:?} / {:?} / {confidence}{muted}: {}",
+                d.status, d.severity, d.summary
+            ),
+            style,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  First seen {:.0}s ago; last observed {:.0}s ago; {:?} for {:.0}s",
+                now.saturating_duration_since(d.first_seen).as_secs_f64(),
+                now.saturating_duration_since(d.last_seen).as_secs_f64(),
+                d.status,
+                now.saturating_duration_since(d.status_since).as_secs_f64()
+            ),
+            theme::dim(),
+        )));
+        for evidence in &d.evidence {
+            lines.push(Line::from(format!("  {evidence}")));
+        }
+        lines.push(Line::from(format!("  Next: {}", d.action)));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "Snapshot findings (target details: v)",
+        theme::bold(theme::FG),
+    )));
+    for proposal in crate::advisor::snapshot_proposals(app) {
+        let muted = if app.is_dismissed(&proposal.id) {
+            " [footer muted]"
+        } else {
+            ""
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{}{muted}", proposal.reason),
+            theme::bold(severity_color(proposal.severity)),
+        )));
+        lines.push(Line::from(format!("  {}", proposal.detail)));
+        lines.push(Line::from(""));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.view_scroll.min(u16::MAX as usize) as u16, 0))
+            .block(rounded_block_styled(
+                Span::styled("Advisor [a]", theme::bold(theme::ACCENT)),
+                focus_style.fg.unwrap_or(theme::BORDER_DIM),
+            )),
+        area,
+    );
+}
+
 fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
     let focus_style = focused_border(app, Focus::Tuning);
 
@@ -1227,7 +1376,7 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame) {
     let area = f.area();
     let w = 50u16.min(area.width.saturating_sub(4));
-    let h = 28u16.min(area.height.saturating_sub(4));
+    let h = 29u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -1272,6 +1421,10 @@ fn draw_help(f: &mut Frame) {
         )),
         Line::from(""),
         Line::from(Span::styled("Toggles", theme::bold(theme::ACCENT))),
+        Line::from(Span::styled(
+            "  a  advisor findings and evidence",
+            Style::default().fg(theme::FG),
+        )),
         Line::from(Span::styled(
             "  v  target capacity / GC pressure",
             Style::default().fg(theme::FG),
@@ -1356,7 +1509,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         if let Some(command) = &proposal.command {
             spans.push(Span::styled(command, theme::dim()));
         }
-        spans.extend(key_hint("v", "targets"));
+        spans.extend(key_hint("a", "advisor"));
         spans.extend(key_hint("N", "mute 2min"));
         spans.extend(key_hint("!", "never"));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1367,6 +1520,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.extend(key_hint("c", "counters"));
         spans.extend(key_hint("t", "blocked"));
         spans.extend(key_hint("p", "procs"));
+        spans.extend(key_hint("a", "advisor"));
         spans.extend(key_hint("v", "targets"));
         if area.width >= 100 {
             spans.extend(key_hint("s", "sort"));
@@ -1748,6 +1902,70 @@ fn read_loadavg_parts() -> (String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisor_renders_evidence_lifecycle_and_muting_without_recommending_a_knob() {
+        use crate::diagnostics::{Confidence, Diagnostic, Status};
+        let mut app = App::new(
+            vec![crate::sysfs::BcachefsFs {
+                uuid: "test".into(),
+                mount_point: "/".into(),
+                fs_name: "test".into(),
+                sysfs: "/nonexistent-nasty-top-test".into(),
+            }],
+            0,
+        );
+        let now = std::time::Instant::now();
+        for (id, status) in [
+            ("active", Status::Active),
+            ("resolved", Status::Resolved),
+            ("stale", Status::Stale),
+        ] {
+            app.diagnostics.findings.insert(
+                id.into(),
+                Diagnostic {
+                    id: id.into(),
+                    severity: crate::targets::Severity::Warning,
+                    confidence: Confidence::Observed,
+                    summary: format!("{id} sample finding"),
+                    evidence: vec!["3 errors over 20s".into()],
+                    action: "Inspect device errors".into(),
+                    first_seen: now,
+                    last_seen: now,
+                    status_since: now,
+                    status,
+                },
+            );
+        }
+        app.dismissed_permanent.insert("test:active".into());
+        assert!(crate::advisor::evaluate(&app).is_none()); // resolved/stale never become fresh footer hints
+        app.show_advisor = true;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "Advisor [a]",
+            "Active",
+            "Resolved",
+            "Stale",
+            "footer muted",
+            "3 errors over 20s",
+            "Next: Inspect device errors",
+        ] {
+            assert!(content.contains(expected), "missing {expected}");
+        }
+        assert!(!content.contains("echo "));
+        terminal.resize(Rect::new(0, 0, 40, 12)).unwrap();
+        app.view_scroll = 5;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
 
     #[test]
     fn targets_view_renders_metadata_capacity_and_unknown_metrics() {

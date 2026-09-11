@@ -20,6 +20,7 @@ pub struct BcachefsFs {
 pub struct DeviceInfo {
     pub index: u32,
     pub name: String,
+    pub member_uuid: Option<String>,
     pub label: Option<String>,
     pub allocation: MemberAllocation,
     pub io_latency_read_ns: u64,
@@ -30,6 +31,8 @@ pub struct DeviceInfo {
     pub io_read_by_type: HashMap<String, u64>,
     pub io_write_by_type: HashMap<String, u64>,
     pub io_errors: u64,
+    /// Missing/malformed counters are not zero; each named counter is optional.
+    pub error_counts: Option<HashMap<String, u64>>,
     /// Time spent doing IO in milliseconds (from /proc/diskstats field 13).
     pub diskstats_io_ms: u64,
     /// Completed read ops (from /proc/diskstats).
@@ -45,6 +48,17 @@ pub struct DeviceInfo {
     pub diskstats_weighted_io_ms: u64,
     /// Whether this snapshot contained a complete parseable diskstats row.
     pub diskstats_valid: bool,
+    pub diskstats_discards: Option<u64>,
+    /// Not tracked for partitions, even when diskstats contains a zero column.
+    pub diskstats_flushes: Option<u64>,
+}
+
+impl DeviceInfo {
+    pub fn identity(&self) -> String {
+        self.member_uuid
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", self.index, self.name))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -57,6 +71,8 @@ struct DiskStats {
     io_ms: u64,
     weighted_io_ms: u64,
     valid: bool,
+    discards: Option<u64>,
+    flushes: Option<u64>,
 }
 
 /// Full time_stats entry from JSON.
@@ -67,6 +83,14 @@ pub struct TimeStatFull {
     pub dur_max_ns: u64,
     pub dur_mean_ns: u64,
     pub dur_recent_ns: u64,
+    pub recent_valid: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct JournalState {
+    pub entries: Option<(u64, u64)>,
+    pub seq: Option<u64>,
+    pub seq_ondisk: Option<u64>,
 }
 
 /// Snapshot of all metrics for one filesystem at one point in time.
@@ -95,6 +119,9 @@ pub struct FsSnapshot {
     pub journal_fill: (u64, u64),
     /// Journal watermark level.
     pub journal_watermark: String,
+    pub journal: JournalState,
+    pub diskstats_sampled_at: Option<std::time::Instant>,
+    pub collection_started_at: Option<std::time::Instant>,
     /// Host RAM from `/proc/meminfo`.
     pub memory_total_bytes: u64,
     pub memory_available_bytes: u64,
@@ -249,7 +276,14 @@ mod tests {
             format!("nasty-top-allocation-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()),
         ));
-        for dir in ["options", "internal", "dev-31", "backing"] {
+        for dir in [
+            "options",
+            "internal",
+            "dev-31",
+            "backing",
+            "time_stats",
+            "time_stats_json",
+        ] {
             std::fs::create_dir_all(fixture.0.join(dir)).unwrap();
         }
         for (name, value) in [
@@ -257,6 +291,8 @@ mod tests {
             ("options/metadata_replicas", "3"),
             ("options/reconcile_enabled", "0"),
             ("dev-31/dev", "nvme0n1p3"),
+            ("dev-31/uuid", "test-member-uuid"),
+            ("dev-31/io_errors", include_str!("fixtures/io-errors.txt")),
             ("dev-31/label", "ssd.nvme.31"),
             ("dev-31/state", "[rw] ro failed spare"),
             ("dev-31/durability", "1"),
@@ -264,6 +300,14 @@ mod tests {
             ("dev-31/bucket_size", "1.00M"),
             ("dev-31/nbuckets", "1000"),
             ("backing/size", "99999999999"),
+            (
+                "time_stats/journal_flush_write",
+                "count: 4\nduration of events\n  mean: 2 s 100 ms\ntime between events\n  mean: 2 s 5 s\n",
+            ),
+            (
+                "time_stats_json/journal_flush_seq",
+                "{\"count\":0,\"duration_ewma_ns\":{\"mean\":0}}",
+            ),
             (
                 "dev-31/alloc_debug",
                 include_str!("fixtures/member-alloc-debug.txt"),
@@ -283,6 +327,21 @@ mod tests {
             sysfs: fixture.0.clone(),
         };
         let first = snapshot(&fs);
+        assert_eq!(first.devices[0].identity(), "test-member-uuid");
+        assert_eq!(first.devices[0].io_errors, 115); // lifetime, not lifetime + since-reset
+        let flush = first
+            .all_time_stats
+            .iter()
+            .find(|s| s.name == "journal_flush_write")
+            .unwrap();
+        assert_eq!(flush.dur_recent_ns, 100_000_000);
+        assert!(flush.recent_valid);
+        assert!(
+            first
+                .all_time_stats
+                .iter()
+                .any(|s| s.name == "journal_flush_seq" && s.count == 0)
+        );
         assert_eq!(first.devices[0].allocation.state.as_deref(), Some("rw"));
         assert_eq!(first.devices[0].allocation.online, Some(true));
         assert_eq!(first.devices[0].allocation.capacity_bytes, Some(1000 << 20)); // member, not entire backing disk
@@ -466,6 +525,58 @@ mod tests {
     }
 
     #[test]
+    fn error_parser_preserves_categories_without_double_counting_reset_section() {
+        let counts = parse_io_errors(include_str!("fixtures/io-errors.txt")).unwrap();
+        assert_eq!(counts["read"], 100);
+        assert_eq!(counts["write"], 12);
+        assert_eq!(counts["checksum"], 1);
+        assert_eq!(counts["flush"], 2);
+        assert_eq!(counts.len(), 4);
+        let legacy = parse_io_errors("read 5\nwrite 2\ncsum 1\n").unwrap();
+        assert_eq!(legacy["checksum"], 1);
+        assert!(!legacy.contains_key("flush"));
+        for invalid in [
+            "",
+            "IO errors since filesystem creation\n",
+            "read: bad\n",
+            "read: 3\nwrite: bad\n",
+        ] {
+            assert!(parse_io_errors(invalid).is_none(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn journal_and_time_stats_keep_unknown_distinct_from_zero() {
+        let (journal, watermark) = parse_journal_state(
+            "dirty journal entries: 0/100\nseq: 19\nseq_ondisk: 18\nwatermark: stripe\n",
+        );
+        assert_eq!(journal.entries, Some((0, 100)));
+        assert_eq!(journal.seq, Some(19));
+        assert_eq!(journal.seq_ondisk, Some(18));
+        assert_eq!(watermark, "stripe");
+        for invalid in [
+            "",
+            "dirty journal entries: ?/100\n",
+            "dirty journal entries: 1/0\n",
+            "dirty journal entries: 101/100\n",
+        ] {
+            assert_eq!(parse_journal_state(invalid).0.entries, None);
+        }
+        assert!(parse_time_stat_text("test", "count: ?\n").is_none());
+        let count_only = parse_time_stat_text("test", "count: 0\n").unwrap();
+        assert_eq!(count_only.count, 0);
+        assert!(!count_only.recent_valid);
+        for mean in ["NaN ms", "-2 ms", "12 unexpected"] {
+            let stat = parse_time_stat_text(
+                "test",
+                &format!("count: 1\nduration of events\nmean: 4 ms {mean}\n"),
+            )
+            .unwrap();
+            assert!(!stat.recent_valid);
+        }
+    }
+
+    #[test]
     fn parses_host_memory_values_as_bytes() {
         let meminfo =
             "MemTotal:       32768 kB\nMemAvailable:   12288 kB\nKReclaimable:    2048 kB\n";
@@ -489,9 +600,21 @@ mod tests {
                 io_ms: 700,
                 weighted_io_ms: 900,
                 valid: true,
+                discards: Some(0),
+                flushes: None,
             }
         );
         assert_eq!(parse_diskstats_for(diskstats, "sdb"), DiskStats::default());
+        let extended = parse_diskstats_for(
+            "8 0 sda 100 0 0 400 50 0 0 600 3 700 900 7 0 0 1 8 2",
+            "sda",
+        );
+        assert_eq!(extended.discards, Some(7));
+        assert_eq!(extended.flushes, Some(8));
+        let old = parse_diskstats_for("8 0 sda 100 0 0 400 50 0 0 600 3 700 900", "sda");
+        assert!(old.valid);
+        assert_eq!(old.discards, None);
+        assert_eq!(old.flushes, None);
         assert_eq!(
             parse_diskstats_for(
                 "8 0 sda invalid 5 2000 400 50 2 1000 600 3 700 900\n",
@@ -516,13 +639,16 @@ pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
 }
 
 pub fn snapshot_after(fs: &BcachefsFs, previous: Option<&FsSnapshot>) -> FsSnapshot {
+    let collection_started_at = Some(std::time::Instant::now());
     let (iowait, cpu_total) = read_cpu_iowait();
-    let (journal_fill, journal_watermark) = read_journal_fill(&fs.sysfs);
+    let (journal, journal_watermark) = read_journal_state(&fs.sysfs);
     let (memory_total_bytes, memory_available_bytes, kernel_reclaimable_bytes) = read_memory_info();
 
     let (space_total, space_used) = read_fs_space(&fs.mount_point);
     let options = read_options(&fs.sysfs);
-    let mut devices = read_devices(&fs.sysfs);
+    let diskstats = std::fs::read_to_string("/proc/diskstats").unwrap_or_default();
+    let diskstats_sampled_at = Some(std::time::Instant::now());
+    let mut devices = read_devices(&fs.sysfs, &diskstats);
     let reuse_allocation = previous.filter(|previous| {
         previous.options == options
             && previous
@@ -533,6 +659,7 @@ pub fn snapshot_after(fs: &BcachefsFs, previous: Option<&FsSnapshot>) -> FsSnaps
                 previous.devices.iter().any(|p| {
                     p.index == d.index
                         && p.name == d.name
+                        && p.member_uuid == d.member_uuid
                         && p.label == d.label
                         && p.allocation.state == d.allocation.state
                         && p.allocation.online == d.allocation.online
@@ -605,8 +732,11 @@ pub fn snapshot_after(fs: &BcachefsFs, previous: Option<&FsSnapshot>) -> FsSnaps
         background,
         cpu_iowait: iowait,
         cpu_total,
-        journal_fill,
+        journal_fill: journal.entries.unwrap_or((0, 0)),
         journal_watermark,
+        journal,
+        diskstats_sampled_at,
+        collection_started_at,
         memory_total_bytes,
         memory_available_bytes,
         kernel_reclaimable_bytes,
@@ -792,7 +922,7 @@ fn read_member_allocation(path: &Path) -> MemberAllocation {
     }
 }
 
-fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
+fn read_devices(sysfs: &Path, diskstats_content: &str) -> Vec<DeviceInfo> {
     let mut devices = Vec::new();
     let entries = match std::fs::read_dir(sysfs) {
         Ok(e) => e,
@@ -823,12 +953,25 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
         let write_lat = read_latency_ns(&dev_path, "write");
 
         let (io_read, io_write, io_read_by_type, io_write_by_type) = read_io_done(&dev_path);
-        let io_errors = read_io_errors(&dev_path);
-        let diskstats = read_diskstats_for(&dev_name);
+        let error_counts =
+            read_file_string(&dev_path.join("io_errors")).and_then(|s| parse_io_errors(&s));
+        let io_errors = error_counts
+            .as_ref()
+            .map(|counts| {
+                counts
+                    .values()
+                    .fold(0u64, |total, n| total.saturating_add(*n))
+            })
+            .unwrap_or(0);
+        let mut diskstats = parse_diskstats_for(diskstats_content, &dev_name);
+        if dev_path.join("block/partition").exists() {
+            diskstats.flushes = None;
+        }
 
         devices.push(DeviceInfo {
             index,
             name: dev_name,
+            member_uuid: read_file_string(&dev_path.join("uuid")),
             label,
             allocation: read_member_allocation(&dev_path),
             io_latency_read_ns: read_lat,
@@ -838,6 +981,7 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
             io_read_by_type,
             io_write_by_type,
             io_errors,
+            error_counts,
             diskstats_io_ms: diskstats.io_ms,
             diskstats_reads: diskstats.reads,
             diskstats_writes: diskstats.writes,
@@ -846,6 +990,8 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
             diskstats_in_flight: diskstats.in_flight,
             diskstats_weighted_io_ms: diskstats.weighted_io_ms,
             diskstats_valid: diskstats.valid,
+            diskstats_discards: diskstats.discards,
+            diskstats_flushes: diskstats.flushes,
         });
     }
     // Sort by (label, natural device name) so labeled groups stay together
@@ -933,16 +1079,44 @@ fn read_io_done(dev_path: &Path) -> (u64, u64, HashMap<String, u64>, HashMap<Str
     (read_total, write_total, read_map, write_map)
 }
 
-fn read_io_errors(dev_path: &Path) -> u64 {
-    let path = dev_path.join("io_errors");
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut total = 0u64;
+fn parse_io_errors(content: &str) -> Option<HashMap<String, u64>> {
+    let mut counts = HashMap::new();
+    let mut since_reset = false;
     for line in content.lines() {
-        if let Some(val) = line.split_whitespace().last() {
-            total += val.parse::<u64>().unwrap_or(0);
+        let line = line.trim();
+        if line == "IO errors since filesystem creation" {
+            // Current upstream prints lifetime and since-reset copies. Use
+            // only lifetime counts, never add/overwrite them with the latter.
+            counts.insert("flush".into(), 0);
+            continue;
         }
+        if line.starts_with("IO errors since ") {
+            since_reset = true;
+            continue;
+        }
+        if line.starts_with("Flush errors (device not honoring FUA/flush):") {
+            counts.insert(
+                "flush".into(),
+                line.split_whitespace().last()?.parse().ok()?,
+            );
+            continue;
+        }
+        if since_reset || line.is_empty() {
+            continue;
+        }
+        let mut fields: Vec<_> = line.split_whitespace().collect();
+        let value = fields.pop()?.parse::<u64>().ok()?;
+        if fields.is_empty() {
+            continue;
+        }
+        let name = fields.join(" ").trim_end_matches(':').to_lowercase();
+        let name = match name.as_str() {
+            "csum" => "checksum".into(),
+            _ => name,
+        };
+        counts.insert(name, value);
     }
-    total
+    counts.keys().any(|key| key != "flush").then_some(counts)
 }
 
 fn read_options(sysfs: &Path) -> HashMap<String, String> {
@@ -1114,13 +1288,9 @@ fn parse_diskstats_for(content: &str, dev_name: &str) -> DiskStats {
         io_ms: values[5],
         weighted_io_ms: values[6],
         valid: true,
+        discards: fields.get(14).and_then(|s| s.parse().ok()),
+        flushes: fields.get(18).and_then(|s| s.parse().ok()),
     }
-}
-
-/// Read per-device request, timing, utilization, and queue statistics.
-fn read_diskstats_for(dev_name: &str) -> DiskStats {
-    let content = std::fs::read_to_string("/proc/diskstats").unwrap_or_default();
-    parse_diskstats_for(&content, dev_name)
 }
 
 /// Read CPU iowait from /proc/stat. Returns (iowait_jiffies, total_jiffies).
@@ -1208,15 +1378,63 @@ fn to_microseconds(val: f64, unit: &str) -> f64 {
     }
 }
 
-/// Read all time_stats from JSON files.
+fn parse_time_stat_text(name: &str, content: &str) -> Option<TimeStatFull> {
+    let count = content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("count:")?.trim().parse().ok())?;
+    let mut stat = TimeStatFull {
+        name: name.into(),
+        count,
+        ..Default::default()
+    };
+    let ns = |value: &str, unit: &str| -> Option<u64> {
+        let value: f64 = value.parse().ok()?;
+        let scale = match unit {
+            "ns" => 1.0,
+            "us" => 1e3,
+            "ms" => 1e6,
+            "s" => 1e9,
+            "m" => 60e9,
+            "h" => 3600e9,
+            _ => return None,
+        };
+        let n = value * scale;
+        (n.is_finite() && n >= 0.0 && n < u64::MAX as f64).then_some(n as u64)
+    };
+    let mut in_duration = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line == "duration of events" {
+            in_duration = true;
+        }
+        if line == "time between events" {
+            break;
+        }
+        if !in_duration {
+            continue;
+        }
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() >= 3 && fields[0] == "max:" {
+            stat.dur_max_ns = ns(fields[1], fields[2]).unwrap_or(0);
+        }
+        if fields.len() >= 3 && fields[0] == "mean:" {
+            stat.dur_mean_ns = ns(fields[1], fields[2]).unwrap_or(0);
+            if fields.len() == 5
+                && let Some(recent) = ns(fields[3], fields[4])
+            {
+                stat.dur_recent_ns = recent;
+                stat.recent_valid = true;
+            }
+        }
+    }
+    Some(stat)
+}
+
+/// Read all time_stats from JSON files, with text fallbacks for journal diagnostics.
 fn read_all_time_stats_json(sysfs: &Path) -> Vec<TimeStatFull> {
     let dir = sysfs.join("time_stats_json");
     let mut result = Vec::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return result,
-    };
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let content = match std::fs::read_to_string(entry.path()) {
             Ok(c) => c,
@@ -1226,17 +1444,33 @@ fn read_all_time_stats_json(sysfs: &Path) -> Vec<TimeStatFull> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let count = json["count"].as_u64().unwrap_or(0);
-        if count == 0 {
-            continue; // skip entries with zero count
-        }
+        let Some(count) = json["count"].as_u64() else {
+            continue;
+        };
         result.push(TimeStatFull {
             name,
             count,
             dur_max_ns: json["duration_ns"]["max"].as_u64().unwrap_or(0),
             dur_mean_ns: json["duration_ns"]["mean"].as_u64().unwrap_or(0),
             dur_recent_ns: json["duration_ewma_ns"]["mean"].as_u64().unwrap_or(0),
+            recent_valid: json["duration_ewma_ns"]["mean"].as_u64().is_some(),
         });
+    }
+    // Older modules expose text only. Keep explicit zero counts so absence of
+    // events is distinguishable from an unavailable stat.
+    for name in [
+        "journal_flush_write",
+        "journal_noflush_write",
+        "journal_flush_seq",
+        "journal_pin_flush_btree",
+        "journal_pin_flush_key_cache",
+    ] {
+        if !result.iter().any(|s| s.name == name)
+            && let Some(content) = read_file_string(&sysfs.join("time_stats").join(name))
+            && let Some(stat) = parse_time_stat_text(name, &content)
+        {
+            result.push(stat);
+        }
     }
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
@@ -1259,7 +1493,7 @@ fn read_blocked_stats(sysfs: &Path) -> Vec<(String, u64, f64)> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let mut count = 0u64;
+        let mut count = None;
         let mut recent_mean_us = 0.0f64;
         let mut in_duration = false;
         for line in content.lines() {
@@ -1268,8 +1502,7 @@ fn read_blocked_stats(sysfs: &Path) -> Vec<(String, u64, f64)> {
                 count = trimmed
                     .split_whitespace()
                     .nth(1)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
+                    .and_then(|v| v.parse::<u64>().ok());
             }
             if trimmed.starts_with("duration of events") {
                 in_duration = true;
@@ -1288,7 +1521,9 @@ fn read_blocked_stats(sysfs: &Path) -> Vec<(String, u64, f64)> {
             }
         }
         let short_name = name.strip_prefix("blocked_").unwrap_or(&name).to_string();
-        result.push((short_name, count, recent_mean_us));
+        if let Some(count) = count {
+            result.push((short_name, count, recent_mean_us));
+        }
     }
     // Sort: non-zero counts first (by count desc), then alphabetical
     result.sort_by(|a, b| {
@@ -1303,12 +1538,15 @@ fn read_blocked_stats(sysfs: &Path) -> Vec<(String, u64, f64)> {
     result
 }
 
-/// Read journal fill from internal/journal_debug.
-fn read_journal_fill(sysfs: &Path) -> ((u64, u64), String) {
+/// Dirty-entry occupancy is not on-disk journal-space utilization.
+fn read_journal_state(sysfs: &Path) -> (JournalState, String) {
     let path = sysfs.join("internal").join("journal_debug");
     let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut dirty = 0u64;
-    let mut total = 1u64;
+    parse_journal_state(&content)
+}
+
+fn parse_journal_state(content: &str) -> (JournalState, String) {
+    let mut journal = JournalState::default();
     let mut watermark = String::new();
     for line in content.lines() {
         let trimmed = line.trim();
@@ -1316,15 +1554,25 @@ fn read_journal_fill(sysfs: &Path) -> ((u64, u64), String) {
             // Format: "187/32768"
             let val = val.trim();
             let parts: Vec<&str> = val.split('/').collect();
-            if parts.len() == 2 {
-                dirty = parts[0].trim().parse().unwrap_or(0);
-                total = parts[1].trim().parse().unwrap_or(1).max(1);
+            if parts.len() == 2
+                && let (Ok(dirty), Ok(total)) = (
+                    parts[0].trim().parse::<u64>(),
+                    parts[1].trim().parse::<u64>(),
+                )
+                && total > 0
+                && dirty <= total
+            {
+                journal.entries = Some((dirty, total));
             }
         } else if let Some(val) = trimmed.strip_prefix("watermark:") {
             watermark = val.trim().to_string();
+        } else if let Some(val) = trimmed.strip_prefix("seq:") {
+            journal.seq = val.trim().parse().ok();
+        } else if let Some(val) = trimmed.strip_prefix("seq_ondisk:") {
+            journal.seq_ondisk = val.trim().parse().ok();
         }
     }
-    ((dirty, total), watermark)
+    (journal, watermark)
 }
 
 /// Skip the CONFIG_RUST warning + continuation line that bcachefs CLI

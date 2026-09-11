@@ -17,7 +17,7 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Large-pool navigation** with synchronized device-table scrolling and worst-pressure-first sorting
 - **Blocked stats view** showing what's actually blocking IO right now (allocator, journal, write buffer, etc.)
 - **Stall detection** with 60-second event log when latency exceeds 200ms
-- **Tuning hints** that flag known bcachefs pressure signals and show an example sysfs command (informational only — not applied automatically)
+- **Evidence-based advisor** (`a`) with time-windowed I/O, journal and device-health findings, supporting measurements, and investigation guidance
 - **Options panel** with inline editing of runtime-tunable sysfs options
 - **Multi-filesystem support** — press `f` to cycle between mounted bcachefs filesystems
 - **Process IO view** showing which processes are doing IO
@@ -25,6 +25,9 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Memory pressure context** with host RAM, available RAM, kernel-reclaimable memory, and the selected filesystem's btree-node cache
 - **Target capacity / GC pressure view** (`v`) with eligible members, raw capacity, free buckets, metadata footprint/backlog, and per-member allocation details
 - **Metadata placement diagnostics** for oversized footprints, insufficient replica members, and unequal-size replica-layout constraints; missing metrics remain explicitly unknown
+- **Outstanding I/O detection** after 30 seconds without observed completions, including discard/flush progress where available
+- **Journal bottleneck classification** distinguishing space, completion, pipeline, metadata-reclaim and write-buffer pressure
+- **Active error and member-state alerts** with separate error categories, UUID-based histories, recovery/stale states, and multi-device error correlation
 - **Session-aware error counts**: the device Err column dims pre-existing counts and turns bold red only when errors grow during the current run — so you can tell at a glance whether a number is dead history or actively climbing
 - **Consistent color scheme**: yellow = read, blue = write, red = errors/stalls
 
@@ -76,12 +79,13 @@ Options:
 | `t` | Toggle blocked stats / time_stats view |
 | `p` | Toggle process IO view |
 | `v` | Toggle target capacity / GC pressure view |
+| `a` | Toggle Advisor findings and evidence view |
 | `s` | Toggle pressure / filesystem device ordering |
 | `r` | Toggle reconcile on/off |
 | `g` | Toggle copygc on/off |
 | `f` | Cycle between filesystems |
 | `Tab` | Switch focus between metrics and options panel |
-| `↑`/`k`, `↓`/`j` | Scroll devices or the active detail view (including Targets) |
+| `↑`/`k`, `↓`/`j` | Scroll devices or the active detail view (including Targets and Advisor) |
 | `Enter` | Edit selected option value (in options panel) |
 | `Esc` | Cancel edit / dismiss status message |
 | `N` | Mute current hint for 2 minutes |
@@ -95,10 +99,12 @@ Options:
 |--------|--------|-------|
 | IO throughput | `dev-N/io_done` (JSON) | Per-type breakdown, diffed per tick |
 | IO latency (device) | `dev-N/io_latency_stats_{r,w}_json` | EWMA mean, shown only when active |
-| Queue depth / await / IOPS / utilization | `/proc/diskstats` | Instantaneous queue plus interval-derived rates |
+| Queue depth / await / IOPS / utilization | `/proc/diskstats` | Read once per tick, with a common monotonic timestamp; optional discard and flush completion counters |
 | IO latency (fs) | `time_stats/data_{read,write}` | "recent" column rolling mean |
 | Blocked stats | `time_stats/blocked_*` | Count delta per tick + recent mean |
-| Journal fill | `internal/journal_debug` | dirty/total entries + watermark |
+| Journal entry occupancy (`JEnt`) | `internal/journal_debug` | Dirty/total entries, watermark and sequence positions; not disk journal-space usage; `?` when unavailable |
+| Device error categories | `dev-N/io_errors` | Lifetime section only, without double-counting the since-reset section |
+| Member identity / state | `dev-N/{uuid,state,block}` | UUID preferred; index/name fallback; state transitions and online status |
 | Btree-node cache | `btree_cache_size` | Kernel-reported main buffers; approximate and not total bcachefs RAM |
 | Host memory | `/proc/meminfo` | Used, available, and kernel-reclaimable memory |
 | Reconcile | `bcachefs reconcile status` | Subprocess, parsed for progress |
@@ -112,7 +118,9 @@ Options:
 
 ## Tuning Hints
 
-When a target constraint or known bcachefs pressure signal fires, a hint appears in the footer. Press `v` for all target findings and the evidence behind them. Capacity/GC findings offer investigation guidance; older tuning hints may also include an example sysfs command. Nothing is applied automatically. Muting one hint reveals the next eligible hint; dismissals are scoped to the filesystem for the current run.
+When a constraint or pressure signal fires, a hint appears in the footer. Press **`a`** for all findings, evidence, first/last observation times, and active/resolved/stale status; **`v`** shows target capacity details. Observed events are distinguished from possible causes. Muting one hint reveals the next eligible hint; dismissals are scoped to the filesystem for the current run and do not hide evidence from the detail views.
+
+The advisor uses up to 60 seconds of valid, timestamped evidence. Missing samples, counter resets, device replacement, and long collection gaps break continuity instead of producing false spikes or extended stall durations. Slow EWMA values only contribute to journal diagnoses when the corresponding operation count advances. The old blanket recommendations to flush more often or increase reserves have been replaced with investigation guidance.
 
 For example, a metadata target with **2.82 TiB** of eligible member capacity and a reported **3.64 TiB** physical btree footprint is flagged, together with its metadata-placement backlog. The view also names members whose kernel GC-pressure signal is non-positive. It reports constraints rather than claiming to prove a reconcile deadlock.
 
