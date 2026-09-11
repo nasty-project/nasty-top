@@ -10,6 +10,9 @@ pub const WINDOW: Duration = Duration::from_secs(60);
 pub const IO_STALL_AFTER: Duration = Duration::from_secs(30);
 const MAX_RECENT_FINDINGS: usize = 128;
 const SLOW_JOURNAL_NS: u64 = 200_000_000;
+const MIN_IO_SAMPLES: usize = 3;
+const HIGH_ENTRY_OCCUPANCY: f64 = 0.8;
+const MIN_ERROR_MEMBERS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
@@ -31,6 +34,7 @@ pub struct Diagnostic {
     pub confidence: Confidence,
     pub summary: String,
     pub evidence: Vec<String>,
+    pub criteria: String,
     pub action: String,
     pub first_seen: Instant,
     pub last_seen: Instant,
@@ -43,16 +47,23 @@ struct Observation {
     confidence: Confidence,
     summary: String,
     evidence: Vec<String>,
+    criteria: String,
     action: String,
 }
 
 impl Observation {
-    fn observed(summary: String, evidence: Vec<String>, action: &str) -> Self {
+    fn observed(
+        summary: String,
+        evidence: Vec<String>,
+        action: &str,
+        criteria: impl Into<String>,
+    ) -> Self {
         Self {
             severity: Severity::Warning,
             confidence: Confidence::Observed,
             summary,
             evidence,
+            criteria: criteria.into(),
             action: action.into(),
         }
     }
@@ -349,6 +360,14 @@ mod tests {
         snap.diskstats_sampled_at = Some(now);
         snap.collection_started_at = Some(now);
         engine.update("fs-1", snap, now, Duration::from_secs(2));
+        for finding in engine.findings.values() {
+            assert!(!finding.criteria.is_empty(), "{} has no rule", finding.id);
+            assert!(
+                !finding.evidence.is_empty(),
+                "{} has no indicators",
+                finding.id
+            );
+        }
     }
 
     fn block(snap: &mut FsSnapshot, name: &str, count: u64) {
@@ -626,6 +645,19 @@ mod tests {
                 .action
                 .contains("not an established remedy")
         );
+        block(&mut snap, "allocate", 1);
+        step(&mut engine, &mut snap, origin, 4);
+        assert!(
+            engine.findings["allocator:pressure"]
+                .criteria
+                .contains("blocked_allocate")
+        );
+        assert!(
+            engine.findings["allocator:pressure"]
+                .evidence
+                .iter()
+                .any(|s| s.contains("1 events"))
+        );
     }
 
     #[test]
@@ -850,6 +882,7 @@ pub struct Diagnostics {
     last_update: Option<Instant>,
     pub findings: BTreeMap<String, Diagnostic>,
     seen: HashSet<String>,
+    sampling_evidence: String,
     latency_history: HashMap<String, crate::trends::LatencyHistory>,
     headroom_history: HashMap<String, crate::trends::HeadroomHistory>,
     pub peer_contexts: HashMap<String, crate::peers::PeerContext>,
@@ -881,6 +914,12 @@ impl Diagnostics {
     fn record(&mut self, id: &str, observation: Option<Observation>, valid: bool, now: Instant) {
         self.seen.insert(id.into());
         if let Some(o) = observation {
+            debug_assert!(
+                !o.criteria.trim().is_empty() && !o.evidence.is_empty(),
+                "finding {id} needs an explanation"
+            );
+            let mut evidence = o.evidence;
+            evidence.push(self.sampling_evidence.clone());
             let first_seen = self
                 .findings
                 .get(id)
@@ -893,7 +932,8 @@ impl Diagnostics {
                     severity: o.severity,
                     confidence: o.confidence,
                     summary: o.summary,
-                    evidence: o.evidence,
+                    evidence,
+                    criteria: o.criteria,
                     action: o.action,
                     first_seen,
                     last_seen: now,
@@ -965,6 +1005,18 @@ impl Diagnostics {
         let filesystem_fresh = snap
             .collection_started_at
             .is_some_and(|at| at <= now && now.duration_since(at) <= gap);
+        let age = |at: Option<Instant>| {
+            at.map_or("unknown".into(), |at| {
+                format!("{:.3}s", now.saturating_duration_since(at).as_secs_f64())
+            })
+        };
+        self.sampling_evidence = format!(
+            "Collection gates: max accepted gap={:.3}s; block sample age={}; filesystem collection age={}; filesystem_fresh={filesystem_fresh}. Counter windows cover at most {}s; each indicator reports its actual coverage.",
+            gap.as_secs_f64(),
+            age(snap.diskstats_sampled_at),
+            age(snap.collection_started_at),
+            WINDOW.as_secs()
+        );
         let mut members = HashSet::new();
         let mut error_members = Vec::new();
         let mut errors_valid = filesystem_fresh && !snap.devices.is_empty();
@@ -988,10 +1040,17 @@ impl Diagnostics {
         self.progress.retain(|key, _| members.contains(key));
         self.member_states.retain(|key, _| members.contains(key));
         self.error_shapes.retain(|key, _| members.contains(key));
-        let grouped = (error_members.len() >= 2).then(|| {
+        let grouped = (error_members.len() >= MIN_ERROR_MEMBERS).then(|| {
             let mut o = Observation::observed(format!("Errors increased on {} members in the evidence window", error_members.len()),
                 vec![error_members.join(", "), "Counter increases occurred within the last 60s of valid observations; this does not establish simultaneous failures.".into()],
-                "Inspect shared power, cables, backplanes and controllers alongside individual device health.");
+                "Inspect shared power, cables, backplanes and controllers alongside individual device health.",
+                format!("members with ANY valid positive error-counter delta in the last {}s >= {MIN_ERROR_MEMBERS}", WINDOW.as_secs()));
+            o.evidence.push(format!("matching_members={} >= {MIN_ERROR_MEMBERS}", error_members.len()));
+            for d in snap.devices.iter().filter(|d| error_members.contains(&d.name)) {
+                if let Some(finding) = self.findings.get(&format!("device:{}:errors", d.identity())) {
+                    o.evidence.extend(finding.evidence.iter().filter(|line| !line.starts_with("Collection gates:")).map(|line| format!("{}: {line}", d.name)));
+                }
+            }
             o.confidence = Confidence::PossibleCause;
             o
         });
@@ -1074,11 +1133,16 @@ impl Diagnostics {
                     let mut evidence = vec![format!("{}; peers: {}", context.description, s.peers.join(", ")),
                         format!("Read/write direction matched; AQ {:.2} versus peer median AQ {:.2}. Similar request rates and I/O mix; {} valid observations.", s.queue, s.median_queue, p.samples),
                         p.baseline_ms.map_or("Own earlier comparable/non-outlier baseline: unavailable.".into(), |ms| format!("Own earlier comparable/non-outlier baseline: {ms:.1}ms (request weighted, recent 5 minutes)."))];
+                    evidence.extend(s.selection_evidence.iter().cloned());
+                    evidence.push(format!("await={:.3}ms > threshold={:.3}ms; peer median={:.3}ms, media floor={:.3}ms; peer_count={}; duration={:.3}s >= {}s; observations={} >= {}",
+                        s.await_ms, s.threshold_ms(), s.median_ms, s.floor_ms, s.peers.len(), p.seconds, crate::trends::PEER_AFTER.as_secs(), p.samples, crate::trends::PEER_MIN_SAMPLES));
+                    evidence.push("The own-device baseline and error-counter correlation above are context, not trigger conditions.".into());
                     if self.findings.get(&format!("device:{key}:errors")).is_some_and(|d| d.status == Status::Active) {
                         evidence.push("Device error counters also increased in the evidence window.".into());
                     }
                     Observation::observed(format!("{}: {direction} await {:.1}ms vs peers {:.1}ms for {:.0}s", device.name, s.await_ms, s.median_ms, p.seconds), evidence,
-                        "Inspect the member and its workload. Comparable-peer latency is an outlier signal, not proof of hardware failure; request sizes/locality and other users of a backing disk may differ.")
+                        "Inspect the member and its workload. Comparable-peer latency is an outlier signal, not proof of hardware failure; request sizes/locality and other users of a backing disk may differ.",
+                        format!("{}; deviation persists >= {}s with >= {} consecutive valid observations and unchanged peer group", s.criteria(), crate::trends::PEER_AFTER.as_secs(), crate::trends::PEER_MIN_SAMPLES))
                 });
                 self.record(&id, observation, valid, now);
             }
@@ -1110,10 +1174,14 @@ impl Diagnostics {
                 .observe(&signature, point, crate::trends::ALLOC_INTERVAL + gap);
             let observation = summary.alert.then(|| Observation::observed(
                 format!("{} target {}: free-bucket headroom is declining", report.role, report.target),
-                vec![format!("{} → {} over {:.0}s ({} fresh allocator samples).", bytes(Some(summary.first_free)), bytes(Some(summary.last_free)), summary.seconds, summary.samples),
+                {
+                    let mut evidence = vec![format!("{} → {} over {:.0}s ({} fresh allocator samples).", bytes(Some(summary.first_free)), bytes(Some(summary.last_free)), summary.seconds, summary.samples),
                      format!("GC pressure in {}/{} samples ({} unknown); copygc running in {} samples.", summary.pressure_samples, summary.samples, summary.unknown_pressure, summary.gc_running_samples),
-                     format!("Placement backlog: {} → {} (where applicable).", bytes(summary.first_backlog), bytes(summary.last_backlog))],
-                "Inspect per-member allocation, GC and target placement. Free buckets are not guaranteed allocatable space; this measured trend is not a time-until-full prediction."));
+                     format!("Context only: placement backlog {} → {}; copygc running and backlog are not trigger conditions.", bytes(summary.first_backlog), bytes(summary.last_backlog))];
+                    evidence.extend(summary.indicators());
+                    evidence
+                },
+                "Inspect per-member allocation, GC and target placement. Free buckets are not guaranteed allocatable space; this measured trend is not a time-until-full prediction.", summary.criteria()));
             self.record(
                 &id,
                 observation,
@@ -1178,11 +1246,14 @@ impl Diagnostics {
             }
         }
         let stalled_for = p.since.map(|start| at.duration_since(start));
-        let observation = stalled_for.filter(|dt| *dt >= IO_STALL_AFTER && p.samples >= 3).map(|dt| {
+        let observation = stalled_for.filter(|dt| *dt >= IO_STALL_AFTER && p.samples >= MIN_IO_SAMPLES).map(|dt| {
             Observation::observed(format!("{}: outstanding I/O with no observed completions for {:.0}s", d.name, dt.as_secs_f64()),
                 vec![format!("Queue depth {}; {} consecutive valid observations. Threshold: {}s.", p.queue, p.samples, IO_STALL_AFTER.as_secs()),
-                     format!("Read/write completions tracked; discard accounting {}; flush accounting {} (flushes are not tracked for partitions).", if counts[2].is_some() { "available" } else { "unavailable" }, if counts[3].is_some() { "available" } else { "unavailable" })],
-                "Inspect device timeouts, controller resets and kernel logs. Samples show no observed completions, not the age or identity of a particular request.")
+                     format!("Read/write completions tracked; discard accounting {}; flush accounting {} (flushes are not tracked for partitions).", if counts[2].is_some() { "available" } else { "unavailable" }, if counts[3].is_some() { "available" } else { "unavailable" }),
+                     format!("Latest completion counters: read={}, write={}, discard={:?}, flush={:?}. Each available counter had delta=0 throughout the streak; None is unobserved, not zero.", d.diskstats_reads, d.diskstats_writes, d.diskstats_discards, d.diskstats_flushes),
+                     format!("duration={:.3}s >= {}s; observations={} >= {MIN_IO_SAMPLES}; current Q={} > 0", dt.as_secs_f64(), IO_STALL_AFTER.as_secs(), p.samples, p.queue)],
+                "Inspect device timeouts, controller resets and kernel logs. Samples show no observed completions, not the age or identity of a particular request.",
+                format!("valid continuous samples AND Q>0 at every observation AND delta(all available completion counters)=0 AND duration>={}s AND observations>={MIN_IO_SAMPLES}; missing/reset/changed accounting breaks continuity", IO_STALL_AFTER.as_secs()))
         });
         self.progress.insert(key.into(), p);
         self.record(&id, observation, valid || d.diskstats_in_flight == 0, now);
@@ -1209,7 +1280,9 @@ impl Diagnostics {
                 |old| format!("Observed transition: {} / online={} → {} / online={}", old.0, old.1, current.0, current.1));
             let summary = format!("{}: member {} / online={}", d.name, current.0, current.1);
             let mut o = Observation::observed(summary, vec![transition, format!("Member identity {key}; label {}. Current state {} / online={}.", d.label.as_deref().unwrap_or("?"), current.0, current.1)],
-                "Check why the member changed state and inspect device/kernel errors. A state transition can be administrative; it does not prove hardware failure.");
+                "Check why the member changed state and inspect device/kernel errors. A state transition can be administrative; it does not prove hardware failure.",
+                "known(state, online) AND (state != rw OR online=false) AND (observed state change OR earlier unresolved incident)");
+            o.evidence.push(format!("state != rw: {}; online=false: {}; observed_change={changed}; earlier_unresolved_incident={known_incident}", current.0 != "rw", !current.1));
             o.severity = Severity::Critical;
             o
         });
@@ -1243,6 +1316,7 @@ impl Diagnostics {
             return (false, false);
         };
         let mut evidence = Vec::new();
+        let mut has_errors = false;
         let shape: HashSet<_> = counts.keys().cloned().collect();
         let mut valid = !counts.is_empty()
             && self
@@ -1258,14 +1332,19 @@ impl Diagnostics {
                 gap,
             );
             valid &= window.is_some();
-            if let Some(w) = window.filter(|w| w.events > 0) {
+            if let Some(w) = window {
+                has_errors |= w.events > 0;
                 evidence.push(w.describe(name));
+            } else {
+                evidence.push(format!(
+                    "{name}: unknown delta (new/reset counter or baseline unavailable)"
+                ));
             }
         }
         evidence.sort();
-        let has_errors = !evidence.is_empty();
         let observation = has_errors.then(|| Observation::observed(format!("{}: device error counters increased", d.name), evidence,
-            "Inspect this device and its storage path. Counts are new observed bcachefs errors, not SMART totals or proof that data was lost."));
+            "Inspect this device and its storage path. Counts are new observed bcachefs errors, not SMART totals or proof that data was lost.",
+            format!("ANY category has a valid positive counter delta in the last {}s; delta=SUM(valid interval increases); first/reset/missing counters establish a baseline and do not count as increases", WINDOW.as_secs())));
         self.record(&id, observation, valid, now);
         (has_errors, valid)
     }
@@ -1334,9 +1413,8 @@ impl Diagnostics {
             "journal_pin_flush_btree",
             "journal_pin_flush_key_cache",
         ] {
-            if let Some(w) = operations[name].filter(|w| w.events > 0) {
-                evidence.push(w.describe(name));
-            }
+            evidence.push(operations[name].map_or(format!("{name}: unknown (unavailable or establishing baseline); slow predicate has no positive evidence"), |w|
+                format!("{}; fresh EWMA={}; slow={}", w.describe(name), w.recent_ns.map_or("unknown/no active sample".into(), |ns| format!("{:.3}ms", ns as f64 / 1e6)), w.slow())));
         }
         evidence.push(match snap.journal.seq.zip(snap.journal.seq_ondisk) {
             Some((seq, disk)) => format!("Current journal seq {seq}; on-disk seq {disk}. A snapshot difference alone is not a stall."),
@@ -1364,6 +1442,7 @@ impl Diagnostics {
                 "Journal-space pressure",
                 Confidence::Observed,
                 "Inspect journal reclaim and allocation headroom. Entry occupancy alone is not disk journal utilization.",
+                "P(journal_low_on_space)",
             ))
         } else if (events(flight) || events(open))
             && (slow("journal_pin_flush_btree") || slow("journal_pin_flush_key_cache"))
@@ -1372,6 +1451,7 @@ impl Diagnostics {
                 "Possible metadata-reclaim bottleneck affecting the journal",
                 Confidence::PossibleCause,
                 "Inspect btree/key-cache flushing and metadata-device latency. These events coincide; the dependency is not proven.",
+                "no earlier match AND (P(journal_max_in_flight) OR P(journal_max_open)) AND (S(journal_pin_flush_btree) OR S(journal_pin_flush_key_cache))",
             ))
         } else if events(flight)
             && (slow("journal_flush_write")
@@ -1382,18 +1462,21 @@ impl Diagnostics {
                 "Possible journal-completion bottleneck",
                 Confidence::PossibleCause,
                 "Inspect outstanding journal work and per-device flush latency. Enlarging the journal is not justified by in-flight blocking alone.",
+                "no earlier match AND P(journal_max_in_flight) AND (S(journal_flush_write) OR S(journal_noflush_write) OR S(journal_flush_seq))",
             ))
         } else if events(open) || events(flight) {
             Some((
                 "Journal-pipeline pressure",
                 Confidence::Observed,
                 "Inspect outstanding journal work and its dependencies. Space exhaustion and the underlying cause require additional evidence.",
+                "no earlier match AND (P(journal_max_open) OR P(journal_max_in_flight))",
             ))
         } else {
             None
         };
-        let observation = classification.map(|(summary, confidence, action)| {
-            let mut o = Observation::observed(summary.into(), evidence, action);
+        let observation = classification.map(|(summary, confidence, action, rule)| {
+            let criteria = format!("{rule}. P(x) := known positive delta in the window; S(x) := P(x) AND known fresh EWMA >= {:.0}ms. Match order: space, reclaim, completion, pipeline. Unknown is not positive evidence; it is not proof of absence.", SLOW_JOURNAL_NS as f64 / 1e6);
+            let mut o = Observation::observed(summary.into(), evidence, action, criteria);
             o.confidence = confidence;
             o
         });
@@ -1405,14 +1488,17 @@ impl Diagnostics {
         );
         let buffer = blocked["write_buffer_full"];
         self.record("journal:write-buffer", buffer.filter(|w| w.events > 0).map(|w| Observation::observed("Write-buffer pressure".into(), vec![w.describe("write_buffer_full")],
-            "Inspect btree write-buffer flushing and metadata-device pressure; more journal flushes are not an established remedy.")), buffer.is_some(), now);
+            "Inspect btree write-buffer flushing and metadata-device pressure; more journal flushes are not an established remedy.",
+            format!("known delta(blocked_write_buffer_full) > 0 over the last {}s of valid observations", WINDOW.as_secs()))), buffer.is_some(), now);
         let allocate = blocked["allocate"];
         self.record("allocator:pressure", allocate.filter(|w| w.events > 0).map(|w| Observation::observed("Allocator blocking observed".into(), vec![w.describe("allocate")],
-            "Inspect member free buckets, reserves and GC pressure in Targets [v]. Increasing the reserve cannot create physical capacity.")), allocate.is_some(), now);
+            "Inspect member free buckets, reserves and GC pressure in Targets [v]. Increasing the reserve cannot create physical capacity.",
+            format!("known delta(blocked_allocate) > 0 over the last {}s of valid observations", WINDOW.as_secs()))), allocate.is_some(), now);
         // Report what this counter measures, never call it disk space used.
-        self.record("journal:entry-occupancy", snap.journal.entries.filter(|(dirty, total)| *total > 0 && *dirty as f64 / *total as f64 > 0.8).map(|(dirty, total)| {
+        self.record("journal:entry-occupancy", snap.journal.entries.filter(|(dirty, total)| *total > 0 && *dirty as f64 / *total as f64 > HIGH_ENTRY_OCCUPANCY).map(|(dirty, total)| {
             Observation::observed("High journal dirty-entry occupancy".into(), vec![format!("{dirty}/{total} dirty entries ({:.1}%). This is not on-disk journal-space usage.", dirty as f64 / total as f64 * 100.0)],
-                "Use journal blocking and reclaim evidence to determine whether this occupancy is limiting progress.")
+                "Use journal blocking and reclaim evidence to determine whether this occupancy is limiting progress.",
+                format!("known dirty and total entries AND total>0 AND dirty/total > {HIGH_ENTRY_OCCUPANCY} ({:.0}%)", HIGH_ENTRY_OCCUPANCY * 100.0))
         }), snap.journal.entries.is_some(), now);
     }
 }

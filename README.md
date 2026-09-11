@@ -18,6 +18,7 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Blocked stats view** showing what's actually blocking IO right now (allocator, journal, write buffer, etc.)
 - **Stall detection** with 60-second event log when latency exceeds 200ms
 - **Evidence-based advisor** (`a`) with time-windowed I/O, journal and device-health findings, supporting measurements, and investigation guidance
+- **Explain any hint** (`w`) with the exact rule/equation and captured indicators, including thresholds and unavailable inputs
 - **Options panel** with inline editing of runtime-tunable sysfs options
 - **Multi-filesystem support** — press `f` to cycle between mounted bcachefs filesystems
 - **Process IO view** showing which processes are doing IO
@@ -83,6 +84,7 @@ Options:
 | `p` | Toggle process IO view |
 | `v` | Toggle target capacity / GC pressure view |
 | `a` | Toggle Advisor findings and evidence view |
+| `w` | Explain the current hint: captured rule/equation and indicators |
 | `s` | Toggle pressure / filesystem device ordering |
 | `r` | Toggle reconcile on/off |
 | `g` | Toggle copygc on/off |
@@ -95,6 +97,8 @@ Options:
 | `!` | Never show this hint again |
 | `C` | Clear all permanent mutes |
 | `q` / `Ctrl-C` | Quit |
+
+In the **Why this hint?** view, `↑`/`↓` or `j`/`k` scroll, `PgUp`/`PgDn` move ten lines, `Home` returns to the top, and `w`/`Esc` close the view. The explanation is a frozen copy of the selected hint; monitoring continues, but a new tick cannot replace the inputs you are reading.
 
 ## Data Sources
 
@@ -152,6 +156,24 @@ Press **`v`** for per-target headroom history and member backing-device informat
 | Options | `options/*` | Read/write directly to sysfs |
 
 ## Tuning Hints
+
+**Press `w` on any footer hint to see why it was proposed.** Every finding carries a **Rule / equation** and an **Indicators used** list. The same explanation appears inline in Advisor (`a`), and target findings also include it in Targets (`v`). Rules include their thresholds, gates and assumptions; indicators include the measured values and source context. Unknown inputs remain explicitly unknown. Context-only data, such as a backlog that is not a trigger condition, is labelled separately.
+
+For example, a metadata-capacity hint shows:
+
+```text
+Rule / equation:
+  P > C
+  P = accounted physical btree sectors * 512 (already replicated)
+  C = SUM(raw capacity of eligible target members)
+Indicators used:
+  Eligibility, state, durability and capacity for each member
+  P and C in bytes, plus the computed shortfall
+```
+
+GC hints show the kernel's raw calculated-wait value and the `<= 0` criterion. Peer-latency hints show the peer-selection filters, selected peers' measurements, computed latency threshold, duration and observation count. Headroom hints show each term of the decline/GC-pressure equation. Journal hints show classification order and all considered blocking/latency signals, including unavailable ones. Floating-point values are rounded for display.
+
+Resolved/stale findings retain the criteria and inputs from their last active observation rather than recomputing an explanation from unrelated current measurements.
 
 When a constraint or pressure signal fires, a hint appears in the footer. Press **`a`** for all findings, evidence, first/last observation times, and active/resolved/stale status; **`v`** shows target capacity details. Observed events are distinguished from possible causes. Muting one hint reveals the next eligible hint; dismissals are scoped to the filesystem for the current run and do not hide evidence from the detail views.
 

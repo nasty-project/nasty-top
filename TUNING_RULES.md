@@ -8,6 +8,14 @@ A hint may remain displayed for 15 seconds after first appearing. A resolved or 
 
 Rules are implemented in `src/diagnostics.rs`, `src/advisor.rs`, `src/targets.rs`, `src/peers.rs` and `src/trends.rs`.
 
+## Explaining a Proposal
+
+Press **`w`** to inspect a captured copy of the current footer hint. It includes the stable rule ID, equation/criteria, measured indicators and suggested next investigation. Scroll with arrows/jk or PgUp/PgDn; Home returns to the top and w/Esc closes it. Background refreshes do not replace this captured explanation.
+
+Every windowed and snapshot finding stores its criteria and input list when it is generated. These are also shown inline in Advisor (`a`) and for target findings in Targets (`v`). Resolved/stale records preserve their last active rule inputs. The equations use the same threshold constants as the predicates. Context-only values are labelled; unknown values are not silently replaced with zero.
+
+Journal explanations define `P(x)` as a known positive delta and `S(x)` as a positive operation delta with a known fresh EWMA above the stated threshold. They show the match order (space, reclaim, completion, pipeline), so a later classification can be understood in terms of earlier predicates not matching. Missing evidence is not proof of absence.
+
 ## Evidence Windows and Advisor View
 
 Press **`a`** to inspect all findings, including muted hints and recently resolved/stale diagnoses. The view distinguishes **observed facts** from **possible causes**, and shows supporting measurements, first/last observation times, status age and the next investigation step.

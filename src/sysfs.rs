@@ -432,6 +432,10 @@ mod tests {
         let status = parse_copygc_status(include_str!("fixtures/copy-gc-wait.txt"));
         assert_eq!(status.running, Some(true));
         assert_eq!(status.needs_gc.get("nvme1n1p3"), Some(&true));
+        assert_eq!(
+            status.calculated_wait.get("nvme1n1p3").map(String::as_str),
+            Some("-292M")
+        );
         assert_eq!(status.needs_gc.get("nvme2n1"), Some(&false));
         assert!(!status.needs_gc.contains_key("Currently waiting for"));
         assert!(!status.needs_gc.contains_key("unreported"));
@@ -540,6 +544,25 @@ mod tests {
         assert_eq!(parse_human_bytes("256k"), Some(256 * 1024));
         assert_eq!(parse_human_bytes("1.5M"), Some(1_572_864));
         assert_eq!(parse_human_bytes("unknown"), None);
+    }
+
+    #[test]
+    fn error_parser_handles_compact_colons_from_argon() {
+        let counts = parse_io_errors(include_str!("fixtures/io-errors-compact.txt")).unwrap();
+        assert_eq!(counts["read"], 0);
+        assert_eq!(counts["write"], 0);
+        assert_eq!(counts["checksum"], 2);
+        assert_eq!(counts["flush"], 0);
+        assert_eq!(counts.values().sum::<u64>(), 2); // do not double-count the since-reset section
+        let counts = parse_io_errors(
+            "read:0\nwrite:\t0\ncsum:2\nFlush errors (device not honoring FUA/flush):3\n",
+        )
+        .unwrap();
+        assert_eq!(counts["checksum"], 2);
+        assert_eq!(counts["flush"], 3);
+        for invalid in ["checksum:", "checksum:bad", "checksum:-2", ":2"] {
+            assert!(parse_io_errors(invalid).is_none(), "accepted {invalid}");
+        }
     }
 
     #[test]
@@ -834,6 +857,9 @@ fn parse_copygc_status(content: &str) -> CopyGcStatus {
             let value = value.trim();
             if let Some(magnitude) = parse_human_bytes(value.strip_prefix('-').unwrap_or(value)) {
                 status
+                    .calculated_wait
+                    .insert(name.trim().into(), value.into());
+                status
                     .needs_gc
                     .insert(name.trim().into(), value.starts_with('-') || magnitude == 0);
             }
@@ -1114,22 +1140,28 @@ fn parse_io_errors(content: &str) -> Option<HashMap<String, u64>> {
             since_reset = true;
             continue;
         }
-        if line.starts_with("Flush errors (device not honoring FUA/flush):") {
-            counts.insert(
-                "flush".into(),
-                line.split_whitespace().last()?.parse().ok()?,
-            );
+        if let Some(value) = line.strip_prefix("Flush errors (device not honoring FUA/flush):") {
+            counts.insert("flush".into(), value.trim().parse().ok()?);
             continue;
         }
         if since_reset || line.is_empty() {
             continue;
         }
-        let mut fields: Vec<_> = line.split_whitespace().collect();
-        let value = fields.pop()?.parse::<u64>().ok()?;
-        if fields.is_empty() {
-            continue;
+        // printbuf alignment can leave no padding after long labels, e.g.
+        // "checksum:2". The colon is the delimiter, not optional whitespace.
+        // Retain support for older whitespace-only counter lines as well.
+        let (name, value) = line
+            .split_once(':')
+            .or_else(|| line.rsplit_once(char::is_whitespace))?;
+        let value = value.trim().parse::<u64>().ok()?;
+        let name = name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if name.is_empty() {
+            return None;
         }
-        let name = fields.join(" ").trim_end_matches(':').to_lowercase();
         let name = match name.as_str() {
             "csum" => "checksum".into(),
             _ => name,

@@ -106,6 +106,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help(f);
     }
+    if let Some(hint) = &app.inspected_hint {
+        draw_hint_explanation(f, hint, app.hint_scroll);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -1182,6 +1185,65 @@ fn headroom_lines(
     lines
 }
 
+fn explanation_lines(criteria: &str, evidence: &[String]) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled("  Rule / equation:", theme::bold(theme::FG))),
+        Line::from(format!("    {criteria}")),
+        Line::from(Span::styled("  Indicators used:", theme::bold(theme::FG))),
+    ];
+    lines.extend(
+        evidence
+            .iter()
+            .map(|input| Line::from(format!("    - {input}"))),
+    );
+    lines
+}
+
+fn draw_hint_explanation(f: &mut Frame, hint: &crate::advisor::Proposal, scroll: usize) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(110);
+    let height = area.height.saturating_sub(4);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(ratatui::widgets::Clear, popup);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            hint.reason.clone(),
+            theme::bold(severity_color(hint.severity)),
+        )),
+        Line::from(format!("Rule ID: {}", hint.id)),
+        Line::from("Captured explanation of the selected hint; it does not refresh while open."),
+        Line::from("w/Esc: close   arrows/jk/PgUp/PgDn: scroll   Home: top"),
+        Line::from(
+            "Floating-point values are rounded for display; context-only indicators are labelled.",
+        ),
+        Line::from(""),
+    ];
+    lines.extend(explanation_lines(&hint.criteria, &hint.evidence));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("Next: {}", hint.detail)));
+    if let Some(command) = &hint.command {
+        lines.push(Line::from(format!("Example command: {command}")));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .block(
+                rounded_block_styled(
+                    Span::styled("Why this hint? [w/Esc]", theme::bold(theme::ACCENT)),
+                    theme::ACCENT,
+                )
+                .style(Style::default().bg(theme::BG)),
+            ),
+        popup,
+    );
+}
+
 fn draw_targets(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
     use crate::targets::format_optional_bytes as bytes;
     let block = rounded_block_styled(
@@ -1239,6 +1301,7 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
                 theme::bold(severity_color(finding.severity)),
             )));
             lines.push(Line::from(format!("    {}", finding.detail)));
+            lines.extend(explanation_lines(&finding.criteria, &finding.evidence));
         }
         for note in &report.notes {
             lines.push(Line::from(Span::styled(format!("  {note}"), theme::dim())));
@@ -1299,7 +1362,7 @@ fn draw_advisor(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
     let now = std::time::Instant::now();
     let mut lines = vec![
         Line::from(
-            "Evidence covers up to 60s of valid samples; no-completion detection requires 30s and multiple observations.",
+            "Rules and indicators below are captured when each finding fires; resolved/stale findings retain their last active inputs.",
         ),
         Line::from(
             "Missing data and collection gaps suspend conclusions. Snapshot target constraints are listed separately below.",
@@ -1351,9 +1414,7 @@ fn draw_advisor(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
             ),
             theme::dim(),
         )));
-        for evidence in &d.evidence {
-            lines.push(Line::from(format!("  {evidence}")));
-        }
+        lines.extend(explanation_lines(&d.criteria, &d.evidence));
         lines.push(Line::from(format!("  Next: {}", d.action)));
         lines.push(Line::from(""));
     }
@@ -1403,6 +1464,7 @@ fn draw_advisor(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
             theme::bold(severity_color(proposal.severity)),
         )));
         lines.push(Line::from(format!("  {}", proposal.detail)));
+        lines.extend(explanation_lines(&proposal.criteria, &proposal.evidence));
         lines.push(Line::from(""));
     }
     f.render_widget(
@@ -1472,7 +1534,7 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame) {
     let area = f.area();
     let w = 50u16.min(area.width.saturating_sub(4));
-    let h = 34u16.min(area.height.saturating_sub(4));
+    let h = 35u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -1496,6 +1558,7 @@ fn draw_help(f: &mut Frame) {
         Line::from("  dm-N statistics describe the mapped layer"),
         Line::from(""),
         Line::from(Span::styled("Views", theme::bold(theme::ACCENT))),
+        Line::from("  w  why this hint? (rule + inputs)"),
         Line::from(Span::styled(
             "  c  counters (all sysfs counters)",
             Style::default().fg(theme::FG),
@@ -1597,16 +1660,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(para, area);
     } else if let Some(ref proposal) = app.proposal {
         let color = severity_color(proposal.severity);
-        let mut spans = vec![
-            Span::styled(
-                " HINT ",
-                Style::default()
-                    .fg(theme::BG)
-                    .bg(color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" {} ", proposal.reason), Style::default().fg(color)),
-        ];
+        let mut spans = vec![Span::styled(
+            " HINT ",
+            Style::default()
+                .fg(theme::BG)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        )];
+        // Keep the explanation shortcut ahead of long reasons so it remains
+        // visible even when the rest of the footer is clipped.
+        spans.extend(key_hint("w", "why"));
+        spans.push(Span::styled(
+            format!(" {} ", proposal.reason),
+            Style::default().fg(color),
+        ));
         if let Some(command) = &proposal.command {
             spans.push(Span::styled(command, theme::dim()));
         }
@@ -2005,6 +2072,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn why_hint_renders_equation_inputs_and_unknown_values() {
+        let hint = crate::advisor::Proposal {
+            id: "gc".into(),
+            reason: "GC pressure".into(),
+            severity: crate::targets::Severity::Warning,
+            detail: "Inspect allocation".into(),
+            command: None,
+            criteria: "calculated_wait <= 0".into(),
+            evidence: vec![
+                "calculated_wait=-292M".into(),
+                "free buckets=unknown".into(),
+            ],
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| draw_hint_explanation(f, &hint, 0))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for expected in [
+            "Why this hint?",
+            "Rule / equation:",
+            "Indicators used:",
+            "calculated_wait <= 0",
+            "calculated_wait=-292M",
+            "free buckets=unknown",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        terminal.resize(Rect::new(0, 0, 35, 12)).unwrap();
+        terminal
+            .draw(|f| draw_hint_explanation(f, &hint, 6))
+            .unwrap();
+    }
+
+    #[test]
     fn help_explains_device_pressure_and_queue_columns() {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 45)).unwrap();
@@ -2041,6 +2150,9 @@ mod tests {
             first_backlog: Some(5 << 30),
             last_backlog: Some(6 << 30),
             alert: true,
+            decreases: 12,
+            increases: 0,
+            recent_reference: Some((182 << 30, std::time::Duration::from_secs(30))),
         };
         let lines = headroom_lines(&summary, now);
         let text: String = lines
@@ -2089,6 +2201,7 @@ mod tests {
                     confidence: Confidence::Observed,
                     summary: format!("{id} sample finding"),
                     evidence: vec!["3 errors over 20s".into()],
+                    criteria: "valid error delta > 0".into(),
                     action: "Inspect device errors".into(),
                     first_seen: now,
                     last_seen: now,
@@ -2152,6 +2265,8 @@ mod tests {
                 severity: crate::targets::Severity::Warning,
                 summary: "Metadata footprint 3.64 TiB exceeds target capacity".into(),
                 detail: "Expand the metadata target.".into(),
+                criteria: "physical footprint > target capacity".into(),
+                evidence: vec!["3.64 TiB > 2.82 TiB".into()],
             }],
             notes: vec!["Metadata target backlog: 1.16 TiB".into()],
         }];

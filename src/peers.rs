@@ -5,6 +5,14 @@ use crate::sysfs::{DeviceInfo, FsSnapshot};
 use crate::topology::MediaKind;
 use std::collections::{HashMap, HashSet};
 
+const MIN_OPS: u64 = 5;
+const MIN_PEERS: usize = 2;
+const IOPS_RATIO: f64 = 4.0;
+const QUEUE_RATIO: f64 = 2.0;
+const QUEUE_FLOOR: f64 = 1.0;
+const MIX_DELTA: f64 = 0.25;
+const LATENCY_RATIO: f64 = 3.0;
+
 #[derive(Debug, Clone)]
 pub struct PeerSample {
     pub await_ms: f64,
@@ -14,6 +22,21 @@ pub struct PeerSample {
     pub median_queue: f64,
     pub peers: Vec<String>,
     pub outlier: bool,
+    pub floor_ms: f64,
+    pub selection_evidence: Vec<String>,
+}
+
+impl PeerSample {
+    pub fn criteria(&self) -> String {
+        format!(
+            "same cohort/media/backing count, online and non-overlapping backings; each completed >= {MIN_OPS}, peers >= {MIN_PEERS}; IOPS ratio in [{}, {IOPS_RATIO}]; AQ_a <= max({QUEUE_RATIO}*AQ_b, {QUEUE_FLOOR}) in both directions; abs(read_fraction_a-read_fraction_b) <= {MIX_DELTA}; await > max({LATENCY_RATIO}*peer_median, {}ms)",
+            1.0 / IOPS_RATIO,
+            self.floor_ms
+        )
+    }
+    pub fn threshold_ms(&self) -> f64 {
+        (self.median_ms * LATENCY_RATIO).max(self.floor_ms)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +146,7 @@ pub fn compare(
             .filter(|d| d.topology.media == Some(media))
             .collect();
         members.sort_by_key(|d| d.identity());
-        let description = format!("{group}, {}", media.label());
+        let description = format!("{group}, {} ({} members)", media.label(), members.len());
         let signature = format!(
             "{description}:{:?}",
             members
@@ -163,7 +186,7 @@ fn direction(
     };
     let (completed, await_ms, iops) = values(rate);
     if !rate.diskstats_interval_valid
-        || completed < 5
+        || completed < MIN_OPS
         || !await_ms.is_finite()
         || !iops.is_finite()
         || iops <= 0.0
@@ -174,6 +197,23 @@ fn direction(
     let mut peers = Vec::new();
     let mut latencies = Vec::new();
     let mut queues = Vec::new();
+    let describe = |name: &str, r: &DeviceRate, ops: u64, latency: f64, leaves: &[String]| {
+        format!(
+            "{name}: completed={ops}, await={latency:.3}ms, directional IOPS={:.3}, AQ={:.3}, read_fraction={:.3}, interval={:.3}s, backings={}",
+            if write { r.write_iops } else { r.read_iops },
+            r.avg_queue_depth,
+            r.read_iops / r.total_iops(),
+            r.sample_seconds,
+            leaves.join(", ")
+        )
+    };
+    let mut selection_evidence = vec![describe(
+        &device.name,
+        rate,
+        completed,
+        await_ms,
+        &device.topology.leaves,
+    )];
     for member in members {
         if member.allocation.online != Some(true)
             || member.topology.leaves.is_empty()
@@ -191,16 +231,20 @@ fn direction(
             continue;
         };
         let (ops, latency, peer_iops) = values(peer);
-        if !peer.diskstats_interval_valid || ops < 5 || !latency.is_finite() || peer_iops <= 0.0 {
+        if !peer.diskstats_interval_valid
+            || ops < MIN_OPS
+            || !latency.is_finite()
+            || peer_iops <= 0.0
+        {
             continue;
         }
         // Compare each direction separately, with broadly similar request
         // rates, queue depth and read/write mix. This is still observational.
-        if !(0.25..=4.0).contains(&(iops / peer_iops))
-            || rate.avg_queue_depth > (peer.avg_queue_depth * 2.0).max(1.0)
-            || peer.avg_queue_depth > (rate.avg_queue_depth * 2.0).max(1.0)
+        if !(1.0 / IOPS_RATIO..=IOPS_RATIO).contains(&(iops / peer_iops))
+            || rate.avg_queue_depth > (peer.avg_queue_depth * QUEUE_RATIO).max(QUEUE_FLOOR)
+            || peer.avg_queue_depth > (rate.avg_queue_depth * QUEUE_RATIO).max(QUEUE_FLOOR)
             || (rate.read_iops / rate.total_iops() - peer.read_iops / peer.total_iops()).abs()
-                > 0.25
+                > MIX_DELTA
         {
             continue;
         }
@@ -208,8 +252,15 @@ fn direction(
         peers.push(member.name.clone());
         latencies.push(latency);
         queues.push(peer.avg_queue_depth);
+        selection_evidence.push(describe(
+            &member.name,
+            peer,
+            ops,
+            latency,
+            &member.topology.leaves,
+        ));
     }
-    if peers.len() < 2 {
+    if peers.len() < MIN_PEERS {
         return None;
     }
     let median_ms = median(latencies);
@@ -220,7 +271,9 @@ fn direction(
         queue: rate.avg_queue_depth,
         median_queue: median(queues),
         peers,
-        outlier: await_ms > (median_ms * 3.0).max(media.latency_floor_ms()),
+        outlier: await_ms > (median_ms * LATENCY_RATIO).max(media.latency_floor_ms()),
+        floor_ms: media.latency_floor_ms(),
+        selection_evidence,
     })
 }
 

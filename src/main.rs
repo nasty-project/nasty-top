@@ -187,10 +187,27 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    if app.inspected_hint.is_some() {
+        match key.code {
+            KeyCode::Char('q') => app.should_quit = true,
+            KeyCode::Esc | KeyCode::Char('w') => app.inspected_hint = None,
+            KeyCode::Up | KeyCode::Char('k') => app.hint_scroll = app.hint_scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.hint_scroll = app.hint_scroll.saturating_add(1)
+            }
+            KeyCode::PageUp => app.hint_scroll = app.hint_scroll.saturating_sub(10),
+            KeyCode::PageDown => app.hint_scroll = app.hint_scroll.saturating_add(10),
+            KeyCode::Home => app.hint_scroll = 0,
+            _ => {}
+        }
+        return false;
+    }
+
     let mut reset_tick_deadline = false;
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.show_help = !app.show_help,
+        KeyCode::Char('w') => app.explain_hint(),
         KeyCode::Char('n') | KeyCode::Char('N') => app.dismiss_proposal(),
         KeyCode::Char('!') => app.dismiss_permanent(),
         KeyCode::Char('C') => app.clear_dismissals(),
@@ -292,6 +309,61 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn why_hint_keeps_the_selected_inputs_frozen_and_has_its_own_navigation() {
+        let mut app = App::new(
+            vec![sysfs::BcachefsFs {
+                uuid: "test".into(),
+                mount_point: "/".into(),
+                fs_name: "test".into(),
+                sysfs: "/nonexistent-nasty-top-test".into(),
+            }],
+            0,
+        );
+        app.proposal = Some(advisor::Proposal {
+            id: "gc".into(),
+            reason: "GC pressure".into(),
+            severity: targets::Severity::Warning,
+            detail: "Inspect allocation".into(),
+            command: None,
+            criteria: "calculated_wait <= 0".into(),
+            evidence: vec!["calculated_wait=-292M".into()],
+        });
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        );
+        app.proposal.as_mut().unwrap().evidence[0] = "calculated_wait=10G".into();
+        assert_eq!(
+            app.inspected_hint.as_ref().unwrap().evidence[0],
+            "calculated_wait=-292M"
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        assert_eq!(app.hint_scroll, 10);
+        assert_eq!(app.view_scroll, 0);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.hint_scroll, 0);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.inspected_hint.is_none());
+        app.proposal = None;
+        app.show_help = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        );
+        assert!(app.inspected_hint.is_none());
+        assert!(!app.show_help);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap()
+                .contains("No current hint")
+        );
+    }
 
     #[test]
     fn advisor_navigation_is_exclusive_with_other_detail_views() {
