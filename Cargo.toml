@@ -1,9 +1,16 @@
 [package]
 name = "nasty-top"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2024"
+rust-version = "1.88"
 license = "GPL-3.0-only"
 description = "A top-like TUI for bcachefs filesystems"
+repository = "https://github.com/nasty-project/nasty-top"
+homepage = "https://github.com/nasty-project/nasty-top"
+readme = "README.md"
+keywords = ["bcachefs", "filesystem", "monitoring", "tui"]
+categories = ["command-line-utilities", "filesystem"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "TUNING_RULES.md"]
 
 [dependencies]
 ratatui = "0.30"
