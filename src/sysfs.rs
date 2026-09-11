@@ -21,6 +21,7 @@ pub struct DeviceInfo {
     pub index: u32,
     pub name: String,
     pub member_uuid: Option<String>,
+    pub topology: crate::topology::BlockTopology,
     pub label: Option<String>,
     pub allocation: MemberAllocation,
     pub io_latency_read_ns: u64,
@@ -366,6 +367,23 @@ mod tests {
             Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
         let missing = snapshot_after(&fs, Some(&expired));
         assert_eq!(missing.devices[0].allocation.free_bytes, None); // never reuse stale success after a failed refresh
+        // dm members use the same io_done and diskstats paths as sdX/NVMe.
+        std::fs::write(fixture.0.join("dev-31/dev"), "dm-15").unwrap();
+        std::fs::write(
+            fixture.0.join("dev-31/io_done"),
+            r#"{"read":{"user":8192},"write":{"journal":4096}}"#,
+        )
+        .unwrap();
+        let mapped = read_devices(
+            &fixture.0,
+            "253 15 dm-15 10 0 20 30 40 0 80 90 0 10 20 0 0 0 0 5 10",
+        )
+        .remove(0);
+        assert_eq!(mapped.name, "dm-15");
+        assert_eq!(mapped.io_done_read, 8192);
+        assert_eq!(mapped.io_done_write, 4096);
+        assert_eq!(mapped.diskstats_reads, 10);
+        assert_eq!(mapped.diskstats_writes, 40);
     }
 
     #[test]
@@ -924,6 +942,7 @@ fn read_member_allocation(path: &Path) -> MemberAllocation {
 
 fn read_devices(sysfs: &Path, diskstats_content: &str) -> Vec<DeviceInfo> {
     let mut devices = Vec::new();
+    let mut topology = crate::topology::Resolver::new(Path::new("/sys/class/block"));
     let entries = match std::fs::read_dir(sysfs) {
         Ok(e) => e,
         Err(_) => return devices,
@@ -970,6 +989,7 @@ fn read_devices(sysfs: &Path, diskstats_content: &str) -> Vec<DeviceInfo> {
 
         devices.push(DeviceInfo {
             index,
+            topology: topology.resolve(&dev_name),
             name: dev_name,
             member_uuid: read_file_string(&dev_path.join("uuid")),
             label,

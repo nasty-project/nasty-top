@@ -119,6 +119,7 @@ pub struct TargetReport {
     pub target: String,
     pub members: Vec<String>,
     pub eligible_members: Option<usize>,
+    pub eligible_devices: Vec<String>,
     /// Raw member capacity: an upper bound, before journals/reserves/other data.
     pub capacity_bytes: Option<u64>,
     pub free_bytes: Option<u64>,
@@ -143,7 +144,7 @@ fn sum_known(mut values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     values.try_fold(0u64, |sum, value| sum.checked_add(value?))
 }
 
-fn members_for<'a>(
+pub(crate) fn members_for<'a>(
     config: &TargetConfig,
     devices: &'a [DeviceInfo],
 ) -> Option<Vec<&'a DeviceInfo>> {
@@ -184,6 +185,7 @@ pub fn analyze(snapshot: &FsSnapshot) -> Vec<TargetReport> {
             target: config.target.clone(),
             members: Vec::new(),
             eligible_members: None,
+            eligible_devices: Vec::new(),
             capacity_bytes: None,
             free_bytes: None,
             findings: Vec::new(),
@@ -213,6 +215,7 @@ pub fn analyze(snapshot: &FsSnapshot) -> Vec<TargetReport> {
         let eligible: Vec<_> = members.iter().zip(&eligibility)
             .filter_map(|(d, eligible)| eligible.then_some(*d)).collect();
         report.eligible_members = Some(eligible.len());
+        report.eligible_devices = eligible.iter().map(|d| d.name.clone()).collect();
         report.capacity_bytes = sum_known(eligible.iter().map(|d| d.allocation.capacity_bytes));
         report.free_bytes = sum_known(eligible.iter().map(|d| d.allocation.free_bytes));
         if eligible.len() != members.len() {

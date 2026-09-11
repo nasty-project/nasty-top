@@ -1,7 +1,6 @@
 //! TUI rendering with ratatui — btop-inspired visual style.
 
 use crate::app::{App, Focus};
-use crate::metrics;
 use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -600,8 +599,12 @@ fn draw_device_table(
     let mut devs: Vec<DevData> = Vec::new();
 
     if let Some(rates) = &app.rates {
-        let (median_await, median_queue) = metrics::device_pressure_medians(&rates.devices);
         for d in &rates.devices {
+            let peer_outlier = app
+                .diagnostics
+                .peer_contexts
+                .get(&d.member_key)
+                .is_some_and(|p| p.outlier());
             let rv: Vec<f64> = ["user", "btree", "journal", "sb"]
                 .iter()
                 .map(|t| d.read_by_type.get(*t).copied().unwrap_or(0.0))
@@ -652,8 +655,8 @@ fn draw_device_table(
                 write_iops: d.write_iops,
                 read_await_ms: d.read_await_ms,
                 write_await_ms: d.write_await_ms,
-                pressure_outlier: d.pressure_outlier(median_await, median_queue),
-                pressure_score: d.pressure_score(median_await, median_queue),
+                pressure_outlier: d.pressure_outlier(peer_outlier),
+                pressure_score: d.pressure_score(peer_outlier),
             });
         }
     }
@@ -1145,6 +1148,40 @@ fn severity_color(severity: crate::targets::Severity) -> Color {
     }
 }
 
+fn headroom_lines(
+    summary: &crate::trends::HeadroomSummary,
+    now: std::time::Instant,
+) -> Vec<Line<'static>> {
+    use crate::targets::format_optional_bytes as bytes;
+    let mut lines = vec![
+        Line::from(format!(
+            "  Trend {}: {} → {} over {:.0}s ({} fresh samples; latest {:.0}s ago)",
+            summary.direction,
+            bytes(Some(summary.first_free)),
+            bytes(Some(summary.last_free)),
+            summary.seconds,
+            summary.samples,
+            now.saturating_duration_since(summary.sampled_at)
+                .as_secs_f64()
+        )),
+        Line::from(format!(
+            "  GC pressure {}/{} samples ({} unknown); copygc running in {} samples.",
+            summary.pressure_samples,
+            summary.samples,
+            summary.unknown_pressure,
+            summary.gc_running_samples
+        )),
+    ];
+    if summary.first_backlog.is_some() || summary.last_backlog.is_some() {
+        lines.push(Line::from(format!(
+            "  Placement backlog: {} → {}",
+            bytes(summary.first_backlog),
+            bytes(summary.last_backlog)
+        )));
+    }
+    lines
+}
+
 fn draw_targets(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
     use crate::targets::format_optional_bytes as bytes;
     let block = rounded_block_styled(
@@ -1180,6 +1217,18 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
             bytes(report.capacity_bytes),
             bytes(report.free_bytes)
         )));
+        if let Some(trend) = app
+            .diagnostics
+            .headroom_trends
+            .get(&format!("{}:{}", report.role, report.target))
+        {
+            lines.extend(headroom_lines(trend, std::time::Instant::now()));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  Trend unavailable: requires fresh, known allocator measurements.",
+                theme::dim(),
+            )));
+        }
         for finding in &report.findings {
             let label = match finding.severity {
                 crate::targets::Severity::Warning => "WARN",
@@ -1215,6 +1264,22 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
                     } else {
                         ""
                     }
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "      Backing: {} [{}]; I/O counters belong to {}",
+                        if device.topology.leaves.is_empty() {
+                            "unknown".into()
+                        } else {
+                            device.topology.leaves.join(", ")
+                        },
+                        device
+                            .topology
+                            .media
+                            .map_or("unknown/mixed media", |m| m.label()),
+                        name
+                    ),
+                    theme::dim(),
                 )));
             }
         }
@@ -1290,6 +1355,37 @@ fn draw_advisor(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
             lines.push(Line::from(format!("  {evidence}")));
         }
         lines.push(Line::from(format!("  Next: {}", d.action)));
+        lines.push(Line::from(""));
+    }
+    if app.rates.is_some() {
+        lines.push(Line::from(Span::styled(
+            "Peer latency context (instantaneous; alerts require 30s)",
+            theme::bold(theme::FG),
+        )));
+        for device in &app.current.devices {
+            if let Some(context) = app.diagnostics.peer_contexts.get(&device.identity()) {
+                lines.push(Line::from(format!(
+                    "{}: {}",
+                    device.name, context.description
+                )));
+                for (direction, sample) in [
+                    ("read", context.read.as_ref()),
+                    ("write", context.write.as_ref()),
+                ] {
+                    lines.push(Line::from(sample.map_or(format!("  {direction}: insufficient comparable peers/activity"), |s|
+                        format!("  {direction}: await {:.1}ms / peers {:.1}ms ({} distinct backing peers); AQ {:.2} / {:.2}",
+                            s.await_ms, s.median_ms, s.peers.len(), s.queue, s.median_queue))));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{}: peer comparison unavailable (backing/group/sample unknown)",
+                        device.name
+                    ),
+                    theme::dim(),
+                )));
+            }
+        }
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
@@ -1376,7 +1472,7 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame) {
     let area = f.area();
     let w = 50u16.min(area.width.saturating_sub(4));
-    let h = 29u16.min(area.height.saturating_sub(4));
+    let h = 34u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -1394,6 +1490,11 @@ fn draw_help(f: &mut Frame) {
         .style(Style::default().bg(theme::BG));
 
     let help_text = vec![
+        Line::from(Span::styled("Device columns", theme::bold(theme::ACCENT))),
+        Line::from("  Device ! = pressure, not disk failure"),
+        Line::from("  Q = requests now; AQ = average queue"),
+        Line::from("  dm-N statistics describe the mapped layer"),
+        Line::from(""),
         Line::from(Span::styled("Views", theme::bold(theme::ACCENT))),
         Line::from(Span::styled(
             "  c  counters (all sysfs counters)",
@@ -1904,6 +2005,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn help_explains_device_pressure_and_queue_columns() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 45)).unwrap();
+        terminal.draw(draw_help).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for expected in [
+            "Device ! = pressure, not disk failure",
+            "Q = requests now; AQ = average queue",
+            "dm-N statistics describe the mapped layer",
+        ] {
+            assert!(text.contains(expected));
+        }
+    }
+
+    #[test]
+    fn headroom_display_reports_measured_values_without_a_time_to_full() {
+        let now = std::time::Instant::now();
+        let summary = crate::trends::HeadroomSummary {
+            direction: "falling",
+            seconds: 120.0,
+            samples: 13,
+            first_free: 200 << 30,
+            last_free: 176 << 30,
+            sampled_at: now,
+            pressure_samples: 12,
+            unknown_pressure: 1,
+            gc_running_samples: 10,
+            first_backlog: Some(5 << 30),
+            last_backlog: Some(6 << 30),
+            alert: true,
+        };
+        let lines = headroom_lines(&summary, now);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        for expected in [
+            "falling",
+            "200.00 GiB",
+            "176.00 GiB",
+            "13 fresh samples",
+            "12/13",
+            "1 unknown",
+            "5.00 GiB",
+            "6.00 GiB",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        assert!(!text.contains("until full"));
+    }
+
+    #[test]
     fn advisor_renders_evidence_lifecycle_and_muting_without_recommending_a_knob() {
         use crate::diagnostics::{Confidence, Diagnostic, Status};
         let mut app = App::new(
@@ -1984,6 +2144,7 @@ mod tests {
             target: "ssd.nvme".into(),
             members: vec![],
             eligible_members: Some(3),
+            eligible_devices: Vec::new(),
             capacity_bytes: Some(2_953_869 << 20),
             free_bytes: None,
             findings: vec![crate::targets::Finding {

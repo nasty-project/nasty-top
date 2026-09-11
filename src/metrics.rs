@@ -28,6 +28,9 @@ pub struct DeviceRate {
     pub write_active: bool,
     pub read_iops: f64,
     pub write_iops: f64,
+    pub read_completed: u64,
+    pub write_completed: u64,
+    pub sample_seconds: f64,
     pub util_pct: f64,
     /// Requests currently in progress at the block layer.
     pub queue_depth: u64,
@@ -36,7 +39,7 @@ pub struct DeviceRate {
     /// Average block-layer completion time per request during this interval.
     pub read_await_ms: f64,
     pub write_await_ms: f64,
-    diskstats_interval_valid: bool,
+    pub(crate) diskstats_interval_valid: bool,
     pub io_errors: u64,
 }
 
@@ -49,23 +52,16 @@ impl DeviceRate {
         self.read_await_ms.max(self.write_await_ms)
     }
 
-    pub fn pressure_outlier(&self, median_await_ms: f64, median_queue: f64) -> bool {
-        if self.total_iops() == 0.0
-            && self.queue_depth == 0
-            && self.avg_queue_depth == 0.0
-            && self.util_pct == 0.0
-        {
-            return false;
-        }
-        let await_limit = (median_await_ms * 3.0).max(20.0);
-        let queue_limit = (median_queue * 3.0).max(2.0);
-        self.max_await_ms() > await_limit
-            || self.avg_queue_depth > queue_limit
-            || (self.util_pct >= 95.0 && self.max_await_ms() >= 10.0)
+    pub fn pressure_outlier(&self, peer_latency_outlier: bool) -> bool {
+        self.queue_depth > 4
+            || (self.diskstats_interval_valid
+                && (peer_latency_outlier
+                    || self.avg_queue_depth >= 2.0
+                    || (self.util_pct >= 95.0 && self.max_await_ms() >= 20.0)))
     }
 
-    pub fn pressure_score(&self, median_await_ms: f64, median_queue: f64) -> f64 {
-        let outlier = if self.pressure_outlier(median_await_ms, median_queue) {
+    pub fn pressure_score(&self, peer_latency_outlier: bool) -> f64 {
+        let outlier = if self.pressure_outlier(peer_latency_outlier) {
             10_000.0
         } else {
             0.0
@@ -76,38 +72,6 @@ impl DeviceRate {
             + self.max_await_ms()
             + self.util_pct / 100.0
     }
-}
-
-pub fn device_pressure_medians(devices: &[DeviceRate]) -> (f64, f64) {
-    let median = |mut values: Vec<f64>| {
-        if values.is_empty() {
-            return 0.0;
-        }
-        values.sort_by(f64::total_cmp);
-        values[(values.len() - 1) / 2]
-    };
-    (
-        median(
-            devices
-                .iter()
-                .filter(|device| device.total_iops() > 0.0)
-                .map(DeviceRate::max_await_ms)
-                .collect(),
-        ),
-        median(
-            devices
-                .iter()
-                .filter(|device| {
-                    device.diskstats_interval_valid
-                        && (device.total_iops() > 0.0
-                            || device.queue_depth > 0
-                            || device.avg_queue_depth > 0.0
-                            || device.util_pct > 0.0)
-                })
-                .map(|device| device.avg_queue_depth)
-                .collect(),
-        ),
-    )
 }
 
 fn valid_diskstats_interval(previous: &DeviceInfo, current: &DeviceInfo) -> bool {
@@ -208,6 +172,9 @@ pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
             write_bytes_sec: write_delta as f64 / dt,
             read_active: read_delta > 0,
             write_active: write_delta > 0,
+            read_completed: read_ios,
+            write_completed: write_ios,
+            sample_seconds: block_dt,
             read_iops: if diskstats_valid {
                 read_ios as f64 / block_dt
             } else {
@@ -426,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_detection_is_relative_but_has_absolute_floors() {
+    fn pressure_markers_use_peer_flags_or_absolute_queue_pressure() {
         let normal = DeviceRate {
             read_iops: 100.0,
             read_await_ms: 8.0,
@@ -441,53 +408,17 @@ mod tests {
             diskstats_interval_valid: true,
             ..DeviceRate::default()
         };
-        let devices = vec![normal.clone(), normal, slow.clone()];
-        let (median_await, median_queue) = device_pressure_medians(&devices);
-        assert_eq!((median_await, median_queue), (8.0, 0.5));
-        assert!(slow.pressure_outlier(median_await, median_queue));
-        assert!(!devices[0].pressure_outlier(median_await, median_queue));
-    }
-
-    #[test]
-    fn two_device_pool_uses_lower_median_for_outlier_detection() {
-        let fast = DeviceRate {
-            read_iops: 100.0,
-            read_await_ms: 5.0,
-            ..DeviceRate::default()
-        };
-        let slow = DeviceRate {
-            read_iops: 100.0,
-            read_await_ms: 100.0,
-            ..DeviceRate::default()
-        };
-        let devices = vec![fast, slow.clone()];
-        let (median_await, median_queue) = device_pressure_medians(&devices);
-        assert_eq!(median_await, 5.0);
-        assert!(slow.pressure_outlier(median_await, median_queue));
-    }
-
-    #[test]
-    fn devices_without_completions_do_not_skew_await_median() {
-        let devices = vec![
-            DeviceRate {
-                queue_depth: 4,
-                diskstats_interval_valid: true,
-                ..DeviceRate::default()
-            },
-            DeviceRate {
-                queue_depth: 3,
-                diskstats_interval_valid: true,
-                ..DeviceRate::default()
-            },
-            DeviceRate {
-                read_iops: 10.0,
-                read_await_ms: 8.0,
-                diskstats_interval_valid: true,
-                ..DeviceRate::default()
-            },
-        ];
-
-        assert_eq!(device_pressure_medians(&devices).0, 8.0);
+        assert!(slow.pressure_outlier(false));
+        assert!(!normal.pressure_outlier(false));
+        assert!(normal.pressure_outlier(true));
+        // Ordinary HDD seek latency alone is not an outlier without peers.
+        assert!(
+            !DeviceRate {
+                read_await_ms: 40.0,
+                ..normal
+            }
+            .pressure_outlier(false)
+        );
     }
 
     #[test]

@@ -399,9 +399,10 @@ impl App {
 
         self.previous = Some(std::mem::replace(&mut self.current, new_snap));
         self.target_reports = crate::targets::analyze(&self.current);
-        self.diagnostics.update(
+        self.diagnostics.update_with_rates(
             &self.fs.uuid,
             &self.current,
+            Some(&rates),
             Instant::now(),
             self.expected_interval,
         );
