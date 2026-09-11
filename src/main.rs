@@ -1,5 +1,6 @@
 mod advisor;
 mod app;
+mod diagnostics;
 mod metrics;
 mod sysfs;
 mod targets;
@@ -119,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(filesystems, fs_index);
     let tick_dur = Duration::from_secs_f64(cli.interval);
+    app.expected_interval = tick_dur;
     run(&mut terminal, &mut app, tick_dur)?;
 
     Ok(())
@@ -195,16 +197,28 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.show_processes = false;
                 app.show_blocked = false;
                 app.show_targets = false;
+                app.show_advisor = false;
             }
             app.view_scroll = 0;
         }
         KeyCode::Char('r') => app.toggle_option("reconcile_enabled"),
+        KeyCode::Char('a') => {
+            app.show_advisor = !app.show_advisor;
+            if app.show_advisor {
+                app.show_counters = false;
+                app.show_blocked = false;
+                app.show_processes = false;
+                app.show_targets = false;
+            }
+            app.view_scroll = 0;
+        }
         KeyCode::Char('v') => {
             app.show_targets = !app.show_targets;
             if app.show_targets {
                 app.show_counters = false;
                 app.show_blocked = false;
                 app.show_processes = false;
+                app.show_advisor = false;
             }
             app.view_scroll = 0;
         }
@@ -215,6 +229,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.show_processes = false;
                 app.show_counters = false;
                 app.show_targets = false;
+                app.show_advisor = false;
             }
             app.view_scroll = 0;
         }
@@ -224,6 +239,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.show_blocked = false;
                 app.show_counters = false;
                 app.show_targets = false;
+                app.show_advisor = false;
                 app.view_scroll = 0;
                 // Reset baseline so first tick shows rates.
                 app.prev_proc_io = sysfs::read_all_process_io();
@@ -239,6 +255,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 || app.show_blocked
                 || app.show_processes
                 || app.show_targets
+                || app.show_advisor
             {
                 app.view_scroll = app.view_scroll.saturating_sub(1);
             } else {
@@ -252,6 +269,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 || app.show_blocked
                 || app.show_processes
                 || app.show_targets
+                || app.show_advisor
             {
                 app.view_scroll += 1;
             } else {
@@ -271,6 +289,38 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisor_navigation_is_exclusive_with_other_detail_views() {
+        let mut app = App::new(
+            vec![sysfs::BcachefsFs {
+                uuid: "test".into(),
+                mount_point: "/".into(),
+                fs_name: "test".into(),
+                sysfs: "/nonexistent-nasty-top-test".into(),
+            }],
+            0,
+        );
+        app.show_counters = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert!(app.show_advisor);
+        assert!(!app.show_counters);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.view_scroll, 1);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        assert!(app.show_targets);
+        assert!(!app.show_advisor);
+        assert_eq!(app.view_scroll, 0);
+    }
 
     #[test]
     fn interval_must_be_finite_positive_and_bounded() {

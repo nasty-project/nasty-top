@@ -1,0 +1,9 @@
+IO errors since filesystem creation
+  read:       100
+  write:      12
+  checksum:   1
+IO errors since 2 h ago
+  read:       3
+  write:      1
+  checksum:   0
+Flush errors (device not honoring FUA/flush): 2

@@ -13,6 +13,8 @@ pub struct Rates {
 #[derive(Debug, Clone, Default)]
 pub struct DeviceRate {
     pub name: String,
+    pub member_key: String,
+    pub errors_valid: bool,
     pub label: Option<String>,
     pub read_bytes_sec: f64,
     pub write_bytes_sec: f64,
@@ -152,18 +154,24 @@ pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
     if dt <= 0.0 {
         return Rates::default();
     }
+    let block_dt = match curr.diskstats_sampled_at.zip(prev.diskstats_sampled_at) {
+        Some((now, old)) => now
+            .checked_duration_since(old)
+            .map_or(0.0, |d| d.as_secs_f64()),
+        None => dt,
+    };
 
     let mut devices = Vec::new();
     for curr_dev in &curr.devices {
-        let previous = prev
-            .devices
-            .iter()
-            .find(|device| device.index == curr_dev.index && device.name == curr_dev.name);
+        let previous = prev.devices.iter().find(|device| {
+            device.identity() == curr_dev.identity() && device.name == curr_dev.name
+        });
         // A newly added or re-numbered device has no interval baseline. Use
         // its current counters as the baseline so lifetime totals do not
         // appear as one enormous sample.
         let prev_dev = previous.unwrap_or(curr_dev);
-        let diskstats_valid = previous.is_some_and(|prev| valid_diskstats_interval(prev, curr_dev));
+        let diskstats_valid =
+            block_dt > 0.0 && previous.is_some_and(|prev| valid_diskstats_interval(prev, curr_dev));
 
         let read_delta = curr_dev.io_done_read.saturating_sub(prev_dev.io_done_read);
         let write_delta = curr_dev
@@ -193,20 +201,34 @@ pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
 
         devices.push(DeviceRate {
             name: curr_dev.name.clone(),
+            member_key: curr_dev.identity(),
+            errors_valid: curr_dev.error_counts.is_some(),
             label: curr_dev.label.clone(),
             read_bytes_sec: read_delta as f64 / dt,
             write_bytes_sec: write_delta as f64 / dt,
             read_active: read_delta > 0,
             write_active: write_delta > 0,
-            read_iops: read_ios as f64 / dt,
-            write_iops: write_ios as f64 / dt,
+            read_iops: if diskstats_valid {
+                read_ios as f64 / block_dt
+            } else {
+                0.0
+            },
+            write_iops: if diskstats_valid {
+                write_ios as f64 / block_dt
+            } else {
+                0.0
+            },
             util_pct: {
                 let io_ms_delta = if diskstats_valid {
                     curr_dev.diskstats_io_ms - prev_dev.diskstats_io_ms
                 } else {
                     0
                 } as f64;
-                (io_ms_delta / (dt * 1000.0) * 100.0).min(100.0)
+                if diskstats_valid {
+                    (io_ms_delta / (block_dt * 1000.0) * 100.0).min(100.0)
+                } else {
+                    0.0
+                }
             },
             queue_depth: if curr_dev.diskstats_valid {
                 curr_dev.diskstats_in_flight
@@ -215,7 +237,7 @@ pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
             },
             avg_queue_depth: if diskstats_valid {
                 (curr_dev.diskstats_weighted_io_ms - prev_dev.diskstats_weighted_io_ms) as f64
-                    / (dt * 1000.0)
+                    / (block_dt * 1000.0)
             } else {
                 0.0
             },
@@ -326,6 +348,37 @@ pub fn compute_process_rates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_rates_use_block_sample_times_and_rebaseline_replaced_members() {
+        let now = std::time::Instant::now();
+        let mut previous = FsSnapshot {
+            diskstats_sampled_at: Some(now),
+            devices: vec![DeviceInfo {
+                name: "sda".into(),
+                member_uuid: Some("old".into()),
+                diskstats_valid: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut current = previous.clone();
+        current.diskstats_sampled_at = Some(now + std::time::Duration::from_secs(4));
+        current.devices[0].diskstats_reads = 40;
+        let rates = compute_rates(&previous, &current, 1.0);
+        assert_eq!(rates.devices[0].read_iops, 10.0);
+        current.devices[0].member_uuid = Some("new".into());
+        assert_eq!(
+            compute_rates(&previous, &current, 1.0).devices[0].read_iops,
+            0.0
+        );
+        previous.devices[0].member_uuid = Some("new".into());
+        current.diskstats_sampled_at = Some(now);
+        assert_eq!(
+            compute_rates(&previous, &current, 1.0).devices[0].read_iops,
+            0.0
+        );
+    }
     use crate::sysfs::DeviceInfo;
 
     #[test]
