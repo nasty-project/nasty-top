@@ -168,6 +168,131 @@ mod tests {
     use crate::sysfs::{JournalState, TimeStatFull};
     use crate::targets::MemberAllocation;
 
+    #[test]
+    fn headroom_uses_fresh_allocator_samples_and_missing_space_makes_the_finding_stale() {
+        const GIB: u64 = 1 << 30;
+        let origin = Instant::now();
+        let mut engine = Diagnostics::default();
+        let mut snap = snapshot();
+        snap.target_configs = vec![crate::targets::TargetConfig {
+            role: "metadata",
+            target: "ssd".into(),
+            device_name: None,
+        }];
+        snap.options.insert("metadata_replicas".into(), "1".into());
+        snap.devices[0].label = Some("ssd.1".into());
+        snap.devices[0].allocation.capacity_bytes = Some(500 * GIB);
+        snap.devices[0].allocation.durability = Some(1);
+        snap.devices[0].allocation.data_allowed = Some(vec!["btree".into()]);
+        snap.copygc.needs_gc.insert("nvme1n1".into(), true);
+        snap.copygc.running = Some(true);
+        for secs in (0..=120).step_by(2) {
+            snap.allocation_sampled_at = Some(origin + Duration::from_secs(secs / 10 * 10));
+            snap.devices[0].allocation.free_bytes = Some((200 - secs / 10 * 2) * GIB);
+            step(&mut engine, &mut snap, origin, secs);
+        }
+        let trend = &engine.headroom_trends["metadata:ssd"];
+        assert_eq!(trend.samples, 13);
+        assert_eq!(trend.seconds, 120.0);
+        assert_eq!(
+            engine.findings["headroom:metadata:ssd"].status,
+            Status::Active
+        );
+        snap.options.insert("metadata_replicas".into(), "2".into());
+        step(&mut engine, &mut snap, origin, 122);
+        assert_eq!(engine.headroom_trends["metadata:ssd"].samples, 1);
+        assert_eq!(
+            engine.findings["headroom:metadata:ssd"].status,
+            Status::Stale
+        );
+        snap.devices[0].allocation.free_bytes = None;
+        step(&mut engine, &mut snap, origin, 124);
+        assert_eq!(
+            engine.findings["headroom:metadata:ssd"].status,
+            Status::Stale
+        );
+        assert!(!engine.headroom_trends.contains_key("metadata:ssd"));
+        snap.devices[0].allocation.free_bytes = Some(173 * GIB);
+        snap.allocation_sampled_at = Some(origin + Duration::from_secs(126));
+        step(&mut engine, &mut snap, origin, 126);
+        assert_eq!(engine.headroom_trends["metadata:ssd"].samples, 1);
+        assert_eq!(
+            engine.findings["headroom:metadata:ssd"].status,
+            Status::Stale
+        );
+    }
+
+    #[test]
+    fn peer_latency_finding_resolves_on_recovery_and_suspends_when_backing_peers_overlap() {
+        use crate::metrics::{DeviceRate, Rates};
+        use crate::topology::{BlockTopology, MediaKind};
+        let origin = Instant::now();
+        let mut snap = snapshot();
+        let device = snap.devices[0].clone();
+        snap.devices = (0..3)
+            .map(|i| DeviceInfo {
+                name: format!("dm-{i}"),
+                member_uuid: Some(format!("peer-{i}")),
+                label: Some(format!("ssd.nvme.{i}")),
+                topology: BlockTopology {
+                    media: Some(MediaKind::Nvme),
+                    leaves: vec![format!("nvme{i}n1")],
+                },
+                ..device.clone()
+            })
+            .collect();
+        let mut rates = Rates {
+            devices: snap
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(i, d)| DeviceRate {
+                    name: d.name.clone(),
+                    member_key: d.identity(),
+                    read_iops: 10.0,
+                    read_completed: 20,
+                    read_await_ms: if i == 0 { 100.0 } else { 5.0 },
+                    avg_queue_depth: 0.5,
+                    sample_seconds: 2.0,
+                    diskstats_interval_valid: true,
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let mut engine = Diagnostics::default();
+        for secs in (0..=30).step_by(2) {
+            let now = origin + Duration::from_secs(secs);
+            snap.diskstats_sampled_at = Some(now);
+            snap.collection_started_at = Some(now);
+            for d in &mut snap.devices {
+                d.diskstats_reads = secs * 10;
+            }
+            engine.update_with_rates("fs-1", &snap, Some(&rates), now, Duration::from_secs(2));
+        }
+        assert_eq!(
+            engine.findings["device:peer-0:peer-read"].status,
+            Status::Active
+        );
+        rates.devices[0].read_await_ms = 5.0;
+        let now = origin + Duration::from_secs(32);
+        snap.diskstats_sampled_at = Some(now);
+        snap.collection_started_at = Some(now);
+        engine.update_with_rates("fs-1", &snap, Some(&rates), now, Duration::from_secs(2));
+        assert_eq!(
+            engine.findings["device:peer-0:peer-read"].status,
+            Status::Resolved
+        );
+        snap.devices[1].topology.leaves = snap.devices[0].topology.leaves.clone();
+        let now = origin + Duration::from_secs(34);
+        snap.diskstats_sampled_at = Some(now);
+        snap.collection_started_at = Some(now);
+        engine.update_with_rates("fs-1", &snap, Some(&rates), now, Duration::from_secs(2));
+        assert_eq!(
+            engine.findings["device:peer-0:peer-read"].status,
+            Status::Stale
+        );
+    }
+
     fn snapshot() -> FsSnapshot {
         FsSnapshot {
             devices: vec![DeviceInfo {
@@ -725,6 +850,10 @@ pub struct Diagnostics {
     last_update: Option<Instant>,
     pub findings: BTreeMap<String, Diagnostic>,
     seen: HashSet<String>,
+    latency_history: HashMap<String, crate::trends::LatencyHistory>,
+    headroom_history: HashMap<String, crate::trends::HeadroomHistory>,
+    pub peer_contexts: HashMap<String, crate::peers::PeerContext>,
+    pub headroom_trends: BTreeMap<String, crate::trends::HeadroomSummary>,
 }
 
 impl Diagnostics {
@@ -794,6 +923,17 @@ impl Diagnostics {
         now: Instant,
         expected_interval: Duration,
     ) {
+        self.update_with_rates(fs, snap, None, now, expected_interval);
+    }
+
+    pub fn update_with_rates(
+        &mut self,
+        fs: &str,
+        snap: &FsSnapshot,
+        rates: Option<&crate::metrics::Rates>,
+        now: Instant,
+        expected_interval: Duration,
+    ) {
         if self.filesystem != fs {
             *self = Self {
                 filesystem: fs.into(),
@@ -813,6 +953,8 @@ impl Diagnostics {
             self.progress.clear();
             self.member_states.clear();
             self.error_shapes.clear();
+            self.latency_history.clear();
+            self.headroom_history.clear();
             for d in self.findings.values_mut() {
                 d.status = Status::Stale;
                 d.status_since = now;
@@ -856,9 +998,27 @@ impl Diagnostics {
         self.record("devices:correlated-errors", grouped, errors_valid, now);
         if filesystem_fresh {
             self.journal(snap, now, gap);
+            self.target_headroom(snap, now, gap);
         } else {
             self.member_states.clear();
             self.error_shapes.clear();
+            self.headroom_history.clear();
+            self.headroom_trends.clear();
+        }
+        if filesystem_fresh
+            && snap
+                .diskstats_sampled_at
+                .is_some_and(|at| at <= now && now.duration_since(at) <= gap)
+        {
+            if let Some(rates) = rates {
+                self.peer_latency(snap, rates, now, gap);
+            } else {
+                self.peer_contexts.clear();
+                self.latency_history.clear();
+            }
+        } else {
+            self.peer_contexts.clear();
+            self.latency_history.clear();
         }
         // Missing members/counters lose continuity rather than inheriting old
         // baselines when they reappear. Retain diagnostic history for 60s.
@@ -883,6 +1043,88 @@ impl Diagnostics {
         for (_, id) in recent.into_iter().skip(MAX_RECENT_FINDINGS) {
             self.findings.remove(&id);
         }
+    }
+
+    fn peer_latency(
+        &mut self,
+        snap: &FsSnapshot,
+        rates: &crate::metrics::Rates,
+        now: Instant,
+        gap: Duration,
+    ) {
+        let contexts = crate::peers::compare(snap, rates, gap);
+        let at = snap.diskstats_sampled_at.unwrap();
+        let mut keys = HashSet::new();
+        for (key, context) in &contexts {
+            let device = snap.devices.iter().find(|d| d.identity() == *key).unwrap();
+            for (direction, sample) in [
+                ("read", context.read.as_ref()),
+                ("write", context.write.as_ref()),
+            ] {
+                let id = format!("device:{key}:peer-{direction}");
+                keys.insert(id.clone());
+                let persisted = self.latency_history.entry(id.clone()).or_default().observe(
+                    &context.signature,
+                    sample,
+                    at,
+                    gap,
+                );
+                let valid = sample.is_some_and(|s| !s.outlier) || persisted.is_some();
+                let observation = persisted.zip(sample).map(|(p, s)| {
+                    let mut evidence = vec![format!("{}; peers: {}", context.description, s.peers.join(", ")),
+                        format!("Read/write direction matched; AQ {:.2} versus peer median AQ {:.2}. Similar request rates and I/O mix; {} valid observations.", s.queue, s.median_queue, p.samples),
+                        p.baseline_ms.map_or("Own earlier comparable/non-outlier baseline: unavailable.".into(), |ms| format!("Own earlier comparable/non-outlier baseline: {ms:.1}ms (request weighted, recent 5 minutes)."))];
+                    if self.findings.get(&format!("device:{key}:errors")).is_some_and(|d| d.status == Status::Active) {
+                        evidence.push("Device error counters also increased in the evidence window.".into());
+                    }
+                    Observation::observed(format!("{}: {direction} await {:.1}ms vs peers {:.1}ms for {:.0}s", device.name, s.await_ms, s.median_ms, p.seconds), evidence,
+                        "Inspect the member and its workload. Comparable-peer latency is an outlier signal, not proof of hardware failure; request sizes/locality and other users of a backing disk may differ.")
+                });
+                self.record(&id, observation, valid, now);
+            }
+        }
+        self.latency_history.retain(|key, _| keys.contains(key));
+        self.peer_contexts = contexts;
+    }
+
+    fn target_headroom(&mut self, snap: &FsSnapshot, now: Instant, gap: Duration) {
+        use crate::targets::format_optional_bytes as bytes;
+        let mut summaries = BTreeMap::new();
+        for report in crate::targets::analyze(snap) {
+            let key = format!("{}:{}", report.role, report.target);
+            let id = format!("headroom:{key}");
+            let Some((signature, point)) = crate::trends::headroom_input(
+                snap,
+                &report,
+                now,
+                crate::trends::ALLOC_INTERVAL + gap,
+            ) else {
+                self.headroom_history.remove(&key);
+                self.record(&id, None, false, now);
+                continue;
+            };
+            let summary = self
+                .headroom_history
+                .entry(key.clone())
+                .or_default()
+                .observe(&signature, point, crate::trends::ALLOC_INTERVAL + gap);
+            let observation = summary.alert.then(|| Observation::observed(
+                format!("{} target {}: free-bucket headroom is declining", report.role, report.target),
+                vec![format!("{} → {} over {:.0}s ({} fresh allocator samples).", bytes(Some(summary.first_free)), bytes(Some(summary.last_free)), summary.seconds, summary.samples),
+                     format!("GC pressure in {}/{} samples ({} unknown); copygc running in {} samples.", summary.pressure_samples, summary.samples, summary.unknown_pressure, summary.gc_running_samples),
+                     format!("Placement backlog: {} → {} (where applicable).", bytes(summary.first_backlog), bytes(summary.last_backlog))],
+                "Inspect per-member allocation, GC and target placement. Free buckets are not guaranteed allocatable space; this measured trend is not a time-until-full prediction."));
+            self.record(
+                &id,
+                observation,
+                summary.seconds >= crate::trends::HEADROOM_MIN.as_secs_f64(),
+                now,
+            );
+            summaries.insert(key, summary);
+        }
+        self.headroom_history
+            .retain(|key, _| summaries.contains_key(key));
+        self.headroom_trends = summaries;
     }
 
     fn io_progress(&mut self, d: &DeviceInfo, key: &str, at: Instant, now: Instant, gap: Duration) {

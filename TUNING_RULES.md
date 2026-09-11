@@ -6,7 +6,7 @@ The heuristics are best-effort and unverified upstream; treat them as pointers t
 
 A hint may remain displayed for 15 seconds after first appearing. A resolved or stale windowed finding is explicitly relabelled during that display retention. Snapshot hints no longer matching are labelled "Last observed". Display retention is separate from the duration of supporting evidence, and higher-priority findings can replace the displayed hint.
 
-Rules are implemented in `src/diagnostics.rs`, `src/advisor.rs` and `src/targets.rs`.
+Rules are implemented in `src/diagnostics.rs`, `src/advisor.rs`, `src/targets.rs`, `src/peers.rs` and `src/trends.rs`.
 
 ## Evidence Windows and Advisor View
 
@@ -67,6 +67,37 @@ Reconcile retains both data and metadata backlog columns. A `processing` parent 
 
 The parser fixtures in `src/fixtures/` include excerpts from the 66-device incident dump. `member-alloc-debug.txt` is synthetic, using the installed upstream buckets/sectors/fragmented format to verify units and truncation behavior.
 
+## Peer-Aware Latency
+
+The device table no longer compares all devices against one pool-wide latency median. Peer selection:
+
+1. Choose the narrowest configured target containing the member. When none resolves for that member, use its parent label group; explicitly unlabelled members can use a media-only unlabelled group. A singleton target is not widened just to manufacture peers.
+2. Resolve the block topology through partition parents and `slaves` links. Use the reported media of backing leaves: rotational, NVMe, or other non-rotational. A dm queue reporting non-rotational does not override rotational leaves. Mixed/incomplete/cyclic graphs are unknown. Resolution is cached per collection and bounded to 16 levels, 4096 nodes and 256 leaves.
+3. Require online members, the same media class and backing-leaf count. Exclude the candidate and any peer sharing backing leaves with it or another selected peer. This prevents multiple partitions/mappers sharing a visible backing device becoming independent references. Overlap uses kernel-device names: multipath aliases and hardware resources hidden by a controller may require manual interpretation.
+4. Evaluate reads and writes separately. Require at least 5 completed operations per member per sample and at least **two comparable peers**. Directional IOPS must be within a factor of four; average queues within a factor of two (with a one-request floor); read fractions within 25 percentage points.
+5. A latency deviation exceeds `max(3 * peer median await, media floor)`. Floors are **20ms rotational**, **2ms NVMe**, and **5ms other non-rotational**. The candidate is excluded from the median. Request size/locality and other users of the backing device are not modeled.
+
+The table can mark a deviation immediately. An Advisor finding requires **30 seconds and at least three consecutive valid observations**. Missing peers, changed topology/group, reset counters or sampling gaps break continuity. While a deviation is warming up after missing data, a previous finding remains stale rather than being declared resolved. A valid non-outlier sample resolves it.
+
+Findings show the group, selected peer names, await and AQ comparisons, and optionally the device's own earlier comparable/non-outlier baseline. That baseline is request-weighted, requires at least 30 seconds of history, and uses bounded/coalesced samples from the preceding five minutes. Outlier samples do not update the reference. Concurrent error-counter increases are noted without claiming a hardware cause.
+
+The `!` marker also preserves direct queue pressure: `Q > 4`, or valid interval statistics with `AQ >= 2`, or utilization at least 95% with await at least 20ms. These conditions can flag a mapped-device queue even when no valid peers exist. **`!` is a pressure marker, not an error count or a failed-disk indicator.** `Q` is instantaneous; `AQ` is time-averaged outstanding requests. See the README device-table legend.
+
+## Target Headroom Trends
+
+Each target role records up to **10 minutes / 61 samples**, accepting at most one fresh allocator sample per 10 seconds. Duplicate allocator timestamps are ignored, including their cached pressure/backlog context. Policy, membership, eligible capacity changes, unavailable measurements and collection gaps restart the history. Unknown pressure is retained as unknown.
+
+The Targets view reports net direction over the window, the first/latest free-bucket values, actual coverage, fresh sample count and sample age. It also reports GC pressure and running-copygc sample counts, plus placement backlog for metadata and background targets where available. Targets may overlap; their capacities and trends must not be added together as independent pools.
+
+A falling-headroom warning requires all of:
+- At least **120 seconds** of observations.
+- A net loss of at least **max(64 MiB, 10% of starting free buckets)**.
+- At least three decreasing intervals, with decreases comprising at least 70% of non-flat intervals.
+- A further decline relative to a sample at least 30 seconds before the latest sample (a one-off drop followed by a plateau does not warn).
+- GC pressure recorded in at least **80% of all samples**, including unknown samples in the denominator.
+
+Direction is descriptive net movement, not a forecast. A continued decline without enough GC-pressure evidence is shown in the history but does not trigger this warning. A valid window no longer meeting the rule resolves the finding; an unavailable or rebuilding window leaves it stale. Free buckets are not guaranteed allocatable space, and no time-until-full estimate is produced.
+
 ## Journal / Allocator Classification
 
 Journal classifications share one finding ID, evaluated in the following order. Slow operations require a recent EWMA of at least **200ms**, captured when their operation count advances. An idle, stale EWMA cannot create a completion/reclaim diagnosis. JSON stats have text fallbacks for the journal operations on older modules; known zero counts are retained.
@@ -115,6 +146,4 @@ The `time_stats/blocked_*` entries identify completed blocking events. The Block
 ## Future Rule Ideas
 
 - Reconcile progress tracking, distinguishing scanning, movement and deliberately pending work.
-- Tier-aware device latency comparisons and device-specific baselines.
-- Sustained per-tier headroom trends.
 - PCIe AER counter monitoring correlated with filesystem members.

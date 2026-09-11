@@ -2,9 +2,12 @@ mod advisor;
 mod app;
 mod diagnostics;
 mod metrics;
+mod peers;
 mod sysfs;
 mod targets;
 mod theme;
+mod topology;
+mod trends;
 mod tuning;
 mod ui;
 
