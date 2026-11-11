@@ -1650,8 +1650,9 @@ fn read_fs_space(mount_point: &str) -> (u64, u64) {
     if let Ok(stat) = nix::sys::statvfs::statvfs(mount_point) {
         let total = stat.blocks() as u64 * stat.fragment_size() as u64;
         if total > 0 {
-            let avail = stat.blocks_available() as u64 * stat.fragment_size() as u64;
-            return (total, total.saturating_sub(avail));
+            // Free, not available: matches `df` Used and `bcachefs fs usage`.
+            let free = stat.blocks_free() as u64 * stat.fragment_size() as u64;
+            return (total, total.saturating_sub(free));
         }
     }
     bcachefs_fs_usage_space(mount_point)
